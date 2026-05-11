@@ -1,0 +1,12 @@
+server:
+  port: 8080
+
+proxy:
+  # 你的内部 DeepSeek-V4 / OpenAI 兼容服务地址，注意这里填到 /v1
+  deepseek-base-url: "http://10.0.37.102/v1"
+
+  # 如果内部服务不校验 Key，可以随便写
+  deepseek-api-key: "sk-N2sBmN9IznzOKAjwBe8176FaB86e442296Ac100fD90eF0C8"
+
+  # 实际转发给内部 DeepSeek 的模型名
+  deepseek-model: "deepseek-v31-t-yscku"
