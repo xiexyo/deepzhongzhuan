@@ -42,10 +42,6 @@ proxy:
   # 如果上游报 unknown field stream_options，就改成 false
   include-usage: true
 
-  # 排查流式截断、换行、reasoning_content 时可以临时改 true
-  # 正常使用建议 false，避免日志太大
-  log-stream-chunks: false
-
   # =========================
   # DeepSeek 思考模式配置
   # =========================
@@ -70,7 +66,7 @@ proxy:
   # Agent / Claude Code / tools 场景下默认思考强度
   #
   # 如果开启 thinking，Claude Code / tools 场景建议 max
-  agent-reasoning-effort: max
+  agent-reasoning-effort: high
 
   # 是否把 DeepSeek reasoning_content 暴露成 Anthropic thinking block
   #
@@ -78,3 +74,15 @@ proxy:
   # 因为 DeepSeek 文档要求：
   # thinking + tool call 场景，后续请求必须完整回传 reasoning_content。
   expose-thinking: true
+  # 打印发给 DeepSeek 的请求 payload
+  log-upstream-request: true
+  # 打印 DeepSeek 返回的原始响应
+  log-upstream-response: true
+
+  # 流式 chunk 日志
+  # 排查流式截断、换行、reasoning_content 时可以临时改 true
+  # 正常使用建议 false，避免日志太大
+  log-stream-chunks: true
+
+  # 单段日志最大长度
+  log-body-max-chars: 20000

@@ -68,20 +68,24 @@ public class AnthropicDeepSeekProxyController {
     /**
      * Claude Code / Anthropic Messages API 入口
      */
+    /**
+     * Claude Code / Anthropic Messages API 入口
+     */
     @PostMapping("/v1/messages")
     public Mono<ResponseEntity<?>> messages(@RequestBody JsonNode anthropicRequest) {
+        String requestId = newRequestId();
+
         boolean stream = anthropicRequest.path("stream").asBoolean(false);
+
+        logAnthropicRequestSummary(requestId, anthropicRequest);
 
         if (stream) {
             /*
              * 重点：
              * 这里不用 Flux<ServerSentEvent<String>> 返回给 Claude 插件，
              * 而是手写 Anthropic SSE 文本格式。
-             *
-             * 有些 Claude VSCode 插件对 Spring 自动编码的 SSE 比较敏感，
-             * 可能导致显示成“一小段一行”。
              */
-            Flux<String> flux = streamMessages(anthropicRequest);
+            Flux<String> flux = streamMessages(requestId, anthropicRequest);
 
             ResponseEntity<Flux<String>> entity = ResponseEntity.ok()
                     .header("Cache-Control", "no-cache, no-transform")
@@ -94,6 +98,8 @@ public class AnthropicDeepSeekProxyController {
 
         ObjectNode deepseekPayload = toDeepSeekPayload(anthropicRequest, false);
 
+        logDeepSeekRequest(requestId, false, deepseekPayload);
+
         return deepseekClient.post()
                 .uri("/chat/completions")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -102,15 +108,30 @@ public class AnthropicDeepSeekProxyController {
                 .exchangeToMono(response -> {
                     HttpStatusCode status = response.statusCode();
 
-                    if (status.isError()) {
-                        return response.bodyToMono(String.class)
-                                .defaultIfEmpty("")
-                                .map(body -> {
+                    log.info(
+                            "[{}] DeepSeek non-stream response status={}",
+                            requestId,
+                            status
+                    );
+
+                    /*
+                     * 这里不要直接 bodyToMono(JsonNode.class)，
+                     * 先拿 String，才能把后端原始返回完整打印出来。
+                     */
+                    return response.bodyToMono(String.class)
+                            .defaultIfEmpty("")
+                            .flatMap(body -> {
+                                logDeepSeekRawBody(requestId, "non-stream", body);
+
+                                if (status.isError()) {
                                     log.error(
-                                            "DeepSeek upstream error, status={}, body={}, payload={}",
+                                            "[{}] DeepSeek upstream non-stream error: status={}, body={}, payload={}",
+                                            requestId,
                                             status,
-                                            limit(body, 4000),
-                                            limit(toJsonString(deepseekPayload), 8000)
+                                            limit(body, logBodyMaxChars()),
+                                            properties.isLogUpstreamRequest()
+                                                    ? limit(toJsonString(deepseekPayload), logBodyMaxChars())
+                                                    : "[payload logging disabled]"
                                     );
 
                                     ObjectNode error = anthropicErrorResponse(
@@ -118,26 +139,75 @@ public class AnthropicDeepSeekProxyController {
                                             "DeepSeek upstream returned " + status + ": " + limit(body, 2000)
                                     );
 
-                                    return (ResponseEntity<?>) ResponseEntity
-                                            .status(HttpStatus.BAD_GATEWAY)
-                                            .contentType(MediaType.APPLICATION_JSON)
-                                            .body(error);
-                                });
-                    }
+                                    return Mono.just(
+                                            (ResponseEntity<?>) ResponseEntity
+                                                    .status(HttpStatus.BAD_GATEWAY)
+                                                    .contentType(MediaType.APPLICATION_JSON)
+                                                    .body(error)
+                                    );
+                                }
 
-                    return response.bodyToMono(JsonNode.class)
-                            .map(deepseekResponse -> {
+                                JsonNode deepseekResponse;
+                                try {
+                                    deepseekResponse = mapper.readTree(body);
+                                } catch (Exception e) {
+                                    log.error(
+                                            "[{}] Failed to parse DeepSeek non-stream response as JSON, raw body={}",
+                                            requestId,
+                                            limit(body, logBodyMaxChars()),
+                                            e
+                                    );
+
+                                    ObjectNode error = anthropicErrorResponse(
+                                            "invalid_upstream_response",
+                                            "DeepSeek returned invalid JSON: " + limit(body, 2000)
+                                    );
+
+                                    return Mono.just(
+                                            (ResponseEntity<?>) ResponseEntity
+                                                    .status(HttpStatus.BAD_GATEWAY)
+                                                    .contentType(MediaType.APPLICATION_JSON)
+                                                    .body(error)
+                                    );
+                                }
+
                                 ObjectNode anthropicResponse =
                                         toAnthropicResponse(anthropicRequest, deepseekResponse);
 
-                                return (ResponseEntity<?>) ResponseEntity.ok()
-                                        .contentType(MediaType.APPLICATION_JSON)
-                                        .body(anthropicResponse);
+                                if (properties.isLogUpstreamResponse()) {
+                                    log.info(
+                                            "[{}] Converted Anthropic non-stream response={}",
+                                            requestId,
+                                            limit(toJsonString(anthropicResponse), logBodyMaxChars())
+                                    );
+                                }
+
+                                return Mono.just(
+                                        (ResponseEntity<?>) ResponseEntity.ok()
+                                                .contentType(MediaType.APPLICATION_JSON)
+                                                .body(anthropicResponse)
+                                );
                             });
                 })
                 .onErrorResume(e -> {
-                    log.error("Proxy non-stream request failed, payload={}",
-                            limit(toJsonString(deepseekPayload), 8000), e);
+                    /*
+                     * 这里一般是：
+                     * 1. 连接超时
+                     * 2. DNS 失败
+                     * 3. TCP 连接失败
+                     * 4. TLS 握手失败
+                     *
+                     * 也就是说，大概率没有任何后端响应 body。
+                     */
+                    log.error(
+                            "[{}] Proxy non-stream request failed before valid upstream response: url={}, payload={}",
+                            requestId,
+                            upstreamChatCompletionsUrl(),
+                            properties.isLogUpstreamRequest()
+                                    ? limit(toJsonString(deepseekPayload), logBodyMaxChars())
+                                    : "[payload logging disabled]",
+                            e
+                    );
 
                     ObjectNode error = anthropicErrorResponse(
                             "proxy_error",
@@ -173,8 +243,6 @@ public class AnthropicDeepSeekProxyController {
         ObjectNode payload = mapper.createObjectNode();
         ThinkingConfig thinking = resolveThinking(anthropicRequest);
 
-        payload.put("model", properties.getDeepseekModel());
-        payload.put("stream", stream);
         payload.put("model", properties.getDeepseekModel());
         payload.put("stream", stream);
 
@@ -663,8 +731,10 @@ public class AnthropicDeepSeekProxyController {
      * data: {...}
      *
      */
-    private Flux<String> streamMessages(JsonNode anthropicRequest) {
+    private Flux<String> streamMessages(String requestId, JsonNode anthropicRequest) {
         ObjectNode deepseekPayload = toDeepSeekPayload(anthropicRequest, true);
+
+        logDeepSeekRequest(requestId, true, deepseekPayload);
 
         ThinkingConfig thinking = resolveThinking(anthropicRequest);
 
@@ -682,15 +752,26 @@ public class AnthropicDeepSeekProxyController {
                 .exchangeToFlux(response -> {
                     HttpStatusCode status = response.statusCode();
 
+                    log.info(
+                            "[{}] DeepSeek stream response status={}",
+                            requestId,
+                            status
+                    );
+
                     if (status.isError()) {
                         return response.bodyToMono(String.class)
                                 .defaultIfEmpty("")
                                 .flatMapMany(body -> {
+                                    logDeepSeekRawBody(requestId, "stream-error", body);
+
                                     log.error(
-                                            "DeepSeek upstream stream error, status={}, body={}, payload={}",
+                                            "[{}] DeepSeek upstream stream error: status={}, body={}, payload={}",
+                                            requestId,
                                             status,
-                                            limit(body, 4000),
-                                            limit(toJsonString(deepseekPayload), 8000)
+                                            limit(body, logBodyMaxChars()),
+                                            properties.isLogUpstreamRequest()
+                                                    ? limit(toJsonString(deepseekPayload), logBodyMaxChars())
+                                                    : "[payload logging disabled]"
                                     );
 
                                     return Flux.just(
@@ -709,40 +790,79 @@ public class AnthropicDeepSeekProxyController {
                     Flux<String> body = response
                             .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {
                             })
+                            .doOnSubscribe(subscription -> {
+                                log.info("[{}] DeepSeek stream body subscribed", requestId);
+                            })
+                            .doOnNext(event -> {
+                                /*
+                                 * 这里会打印后端原始 SSE event。
+                                 *
+                                 * 受这些配置控制：
+                                 * proxy.log-upstream-response=true
+                                 * 或
+                                 * proxy.log-stream-chunks=true
+                                 */
+                                logDeepSeekStreamEvent(requestId, event);
+                            })
                             .filter(event -> event.data() != null)
                             .concatMap(event -> {
                                 String data = event.data();
-
-                                if (properties.isLogStreamChunks()) {
-                                    log.info("DeepSeek stream chunk: {}", limit(data, 4000));
-                                }
-
                                 return Flux.fromIterable(state.onDeepSeekSseData(data));
                             })
+                            .doOnComplete(() -> {
+                                log.info("[{}] DeepSeek stream body completed", requestId);
+                            })
                             .onErrorResume(e -> {
+                                /*
+                                 * 流已经开始后发生错误：
+                                 * 可能是上游中途断开、读取超时、SSE 格式异常等。
+                                 */
                                 log.error(
-                                        "DeepSeek upstream stream body failed, payload={}",
-                                        limit(toJsonString(deepseekPayload), 8000),
+                                        "[{}] DeepSeek upstream stream body failed: url={}, payload={}",
+                                        requestId,
+                                        upstreamChatCompletionsUrl(),
+                                        properties.isLogUpstreamRequest()
+                                                ? limit(toJsonString(deepseekPayload), logBodyMaxChars())
+                                                : "[payload logging disabled]",
                                         e
                                 );
 
                                 /*
                                  * 流已经开始后，不建议直接抛 error。
-                                 * Claude VSCode 插件更容易表现为“截断”。
+                                 * Claude VSCode 插件更容易表现为截断。
                                  * 这里尽量补齐 message_stop。
                                  */
                                 return Flux.fromIterable(state.finishEvents());
                             });
 
-                    Flux<String> end = Flux.defer(() ->
-                            Flux.fromIterable(state.finishEvents())
-                    );
+                    Flux<String> end = Flux.defer(() -> {
+                        log.info("[{}] Anthropic stream finishing", requestId);
+                        return Flux.fromIterable(state.finishEvents());
+                    });
 
                     return start.concatWith(body).concatWith(end);
                 })
+                .doOnCancel(() -> {
+                    log.warn("[{}] Downstream client cancelled stream", requestId);
+                })
                 .onErrorResume(e -> {
-                    log.error("Proxy stream request failed before upstream response, payload={}",
-                            limit(toJsonString(deepseekPayload), 8000), e);
+                    /*
+                     * 这里是请求还没有拿到上游 HTTP response 就失败。
+                     *
+                     * 你之前那个：
+                     * Connection timed out: /10.0.37.102:80
+                     *
+                     * 就会走这里。
+                     */
+                    log.error(
+                            "[{}] Proxy stream request failed before upstream response: url={}, payload={}",
+                            requestId,
+                            upstreamChatCompletionsUrl(),
+                            properties.isLogUpstreamRequest()
+                                    ? limit(toJsonString(deepseekPayload), logBodyMaxChars())
+                                    : "[payload logging disabled]",
+                            e
+                    );
 
                     return Flux.just(
                             sse("error", anthropicErrorResponse(
@@ -1494,5 +1614,75 @@ public class AnthropicDeepSeekProxyController {
             case "xhigh", "max" -> "max";
             default -> "high";
         };
+    }
+    private String newRequestId() {
+        return UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    private int logBodyMaxChars() {
+        int max = properties.getLogBodyMaxChars();
+        return max > 0 ? max : 12000;
+    }
+
+    private String upstreamChatCompletionsUrl() {
+        return removeTrailingSlash(properties.getDeepseekBaseUrl()) + "/chat/completions";
+    }
+
+    private void logDeepSeekRequest(String requestId, boolean stream, ObjectNode payload) {
+        log.info(
+                "[{}] DeepSeek request start: stream={}, url={}, model={}",
+                requestId,
+                stream,
+                upstreamChatCompletionsUrl(),
+                payload.path("model").asText("")
+        );
+
+        if (properties.isLogUpstreamRequest()) {
+            log.info(
+                    "[{}] DeepSeek request payload={}",
+                    requestId,
+                    limit(toJsonString(payload), logBodyMaxChars())
+            );
+        }
+    }
+
+    private void logDeepSeekRawBody(String requestId, String scene, String body) {
+        if (properties.isLogUpstreamResponse()) {
+            log.info(
+                    "[{}] DeepSeek {} raw body={}",
+                    requestId,
+                    scene,
+                    limit(body, logBodyMaxChars())
+            );
+        }
+    }
+
+    private void logDeepSeekStreamEvent(String requestId, ServerSentEvent<String> event) {
+        if (properties.isLogUpstreamResponse() || properties.isLogStreamChunks()) {
+            log.info(
+                    "[{}] DeepSeek stream raw event: event={}, id={}, data={}",
+                    requestId,
+                    event.event(),
+                    event.id(),
+                    limit(event.data(), logBodyMaxChars())
+            );
+        }
+    }
+
+    private void logAnthropicRequestSummary(String requestId, JsonNode anthropicRequest) {
+        JsonNode messages = anthropicRequest.path("messages");
+        JsonNode tools = anthropicRequest.path("tools");
+
+        log.info(
+                "[{}] Anthropic request received: stream={}, model={}, max_tokens={}, messages={}, tools={}, thinking={}, output_config={}",
+                requestId,
+                anthropicRequest.path("stream").asBoolean(false),
+                anthropicRequest.path("model").asText(""),
+                anthropicRequest.path("max_tokens").asText(""),
+                messages.isArray() ? messages.size() : 0,
+                tools.isArray() ? tools.size() : 0,
+                anthropicRequest.has("thinking") ? limit(anthropicRequest.path("thinking").toString(), 500) : "null",
+                anthropicRequest.has("output_config") ? limit(anthropicRequest.path("output_config").toString(), 500) : "null"
+        );
     }
 }

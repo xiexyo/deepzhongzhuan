@@ -116,7 +116,46 @@ public class ProxyProperties {
      * 如果 false，则只给用户最终答案。
      */
     private boolean exposeThinking = true;
+    /**
+     * 是否打印转发给 DeepSeek 的完整请求 payload。
+     * 注意：里面会包含用户 prompt、代码内容、系统提示词，生产环境慎开。
+     */
+    private boolean logUpstreamRequest = false;
 
+    /**
+     * 是否打印 DeepSeek 返回的原始响应。
+     * 非流式会打印完整 raw body。
+     * 流式会打印每个 SSE chunk。
+     */
+    private boolean logUpstreamResponse = false;
+
+    /**
+     * 日志里单段 body 最大打印字符数。
+     */
+    private int logBodyMaxChars = 12000;
+    public boolean isLogUpstreamRequest() {
+        return logUpstreamRequest;
+    }
+
+    public void setLogUpstreamRequest(boolean logUpstreamRequest) {
+        this.logUpstreamRequest = logUpstreamRequest;
+    }
+
+    public boolean isLogUpstreamResponse() {
+        return logUpstreamResponse;
+    }
+
+    public void setLogUpstreamResponse(boolean logUpstreamResponse) {
+        this.logUpstreamResponse = logUpstreamResponse;
+    }
+
+    public int getLogBodyMaxChars() {
+        return logBodyMaxChars;
+    }
+
+    public void setLogBodyMaxChars(int logBodyMaxChars) {
+        this.logBodyMaxChars = logBodyMaxChars;
+    }
     public String getThinkingType() {
         return thinkingType;
     }
