@@ -4,7 +4,11 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.codec.ServerSentEvent;
@@ -17,6 +21,8 @@ import java.util.*;
 
 @RestController
 public class AnthropicDeepSeekProxyController {
+
+    private static final Logger log = LoggerFactory.getLogger(AnthropicDeepSeekProxyController.class);
 
     private final ObjectMapper mapper;
     private final ProxyProperties properties;
@@ -44,7 +50,10 @@ public class AnthropicDeepSeekProxyController {
         return Map.of(
                 "status", "ok",
                 "upstream", properties.getDeepseekBaseUrl(),
-                "model", properties.getDeepseekModel()
+                "model", properties.getDeepseekModel(),
+                "forwardTools", properties.isForwardTools(),
+                "forwardToolChoice", properties.isForwardToolChoice(),
+                "maxTokensLimit", properties.getMaxTokensLimit()
         );
     }
 
@@ -72,15 +81,56 @@ public class AnthropicDeepSeekProxyController {
                 .contentType(MediaType.APPLICATION_JSON)
                 .accept(MediaType.APPLICATION_JSON)
                 .bodyValue(deepseekPayload)
-                .retrieve()
-                .bodyToMono(JsonNode.class)
-                .map(deepseekResponse -> {
-                    ObjectNode anthropicResponse =
-                            toAnthropicResponse(anthropicRequest, deepseekResponse);
+                .exchangeToMono(response -> {
+                    HttpStatusCode status = response.statusCode();
 
-                    return ResponseEntity.ok()
-                            .contentType(MediaType.APPLICATION_JSON)
-                            .body(anthropicResponse);
+                    if (status.isError()) {
+                        return response.bodyToMono(String.class)
+                                .defaultIfEmpty("")
+                                .map(body -> {
+                                    log.error(
+                                            "DeepSeek upstream error, status={}, body={}, payload={}",
+                                            status,
+                                            limit(body, 4000),
+                                            limit(toJsonString(deepseekPayload), 8000)
+                                    );
+
+                                    ObjectNode error = anthropicErrorResponse(
+                                            "upstream_error",
+                                            "DeepSeek upstream returned " + status + ": " + limit(body, 2000)
+                                    );
+
+                                    return (ResponseEntity<?>) ResponseEntity
+                                            .status(HttpStatus.BAD_GATEWAY)
+                                            .contentType(MediaType.APPLICATION_JSON)
+                                            .body(error);
+                                });
+                    }
+
+                    return response.bodyToMono(JsonNode.class)
+                            .map(deepseekResponse -> {
+                                ObjectNode anthropicResponse =
+                                        toAnthropicResponse(anthropicRequest, deepseekResponse);
+
+                                return (ResponseEntity<?>) ResponseEntity.ok()
+                                        .contentType(MediaType.APPLICATION_JSON)
+                                        .body(anthropicResponse);
+                            });
+                })
+                .onErrorResume(e -> {
+                    log.error("Proxy non-stream request failed, payload={}",
+                            limit(toJsonString(deepseekPayload), 8000), e);
+
+                    ObjectNode error = anthropicErrorResponse(
+                            "proxy_error",
+                            "Proxy request failed: " + e.getMessage()
+                    );
+
+                    return Mono.just(
+                            ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .body(error)
+                    );
                 });
     }
 
@@ -108,7 +158,14 @@ public class AnthropicDeepSeekProxyController {
         payload.put("stream", stream);
 
         if (anthropicRequest.has("max_tokens")) {
-            payload.set("max_tokens", anthropicRequest.get("max_tokens"));
+            JsonNode maxTokensNode = anthropicRequest.get("max_tokens");
+            Integer limit = properties.getMaxTokensLimit();
+
+            if (limit != null && limit > 0 && maxTokensNode.canConvertToInt()) {
+                payload.put("max_tokens", Math.min(maxTokensNode.asInt(), limit));
+            } else {
+                payload.set("max_tokens", maxTokensNode);
+            }
         }
 
         if (anthropicRequest.has("temperature")) {
@@ -119,7 +176,9 @@ public class AnthropicDeepSeekProxyController {
             payload.set("top_p", anthropicRequest.get("top_p"));
         }
 
-        if (anthropicRequest.has("stop_sequences")) {
+        if (anthropicRequest.has("stop_sequences")
+                && anthropicRequest.get("stop_sequences").isArray()
+                && !anthropicRequest.get("stop_sequences").isEmpty()) {
             payload.set("stop", anthropicRequest.get("stop_sequences"));
         }
 
@@ -141,14 +200,18 @@ public class AnthropicDeepSeekProxyController {
 
         payload.set("messages", messages);
 
-        if (anthropicRequest.has("tools") && anthropicRequest.get("tools").isArray()) {
-            payload.set("tools", convertTools(anthropicRequest.get("tools")));
-        }
+        boolean hasTools = anthropicRequest.has("tools")
+                && anthropicRequest.get("tools").isArray()
+                && !anthropicRequest.get("tools").isEmpty();
 
-        if (anthropicRequest.has("tool_choice")) {
-            JsonNode toolChoice = convertToolChoice(anthropicRequest.get("tool_choice"));
-            if (toolChoice != null) {
-                payload.set("tool_choice", toolChoice);
+        if (properties.isForwardTools() && hasTools) {
+            payload.set("tools", convertTools(anthropicRequest.get("tools")));
+
+            if (properties.isForwardToolChoice() && anthropicRequest.has("tool_choice")) {
+                JsonNode toolChoice = convertToolChoice(anthropicRequest.get("tool_choice"));
+                if (toolChoice != null) {
+                    payload.set("tool_choice", toolChoice);
+                }
             }
         }
 
@@ -179,70 +242,84 @@ public class AnthropicDeepSeekProxyController {
     }
 
     /**
-     * Anthropic user content 可能包含 tool_result，需要转换成 OpenAI 的 role=tool 消息。
+     * Anthropic user content 可能包含 tool_result。
+     *
+     * 关键修复：
+     * OpenAI / DeepSeek 要求 role=tool 的消息必须紧跟在带 tool_calls 的 assistant 消息后。
+     * 所以如果一个 Anthropic user content 里同时有 text 和 tool_result，
+     * 必须先输出 tool 消息，再输出普通 user 文本。
      */
     private void appendUserMessage(JsonNode content, ArrayNode out) {
         if (content == null || content.isNull()) {
-            ObjectNode msg = mapper.createObjectNode();
-            msg.put("role", "user");
-            msg.put("content", "");
-            out.add(msg);
+            addUserText(out, "");
             return;
         }
 
         if (content.isTextual()) {
-            ObjectNode msg = mapper.createObjectNode();
-            msg.put("role", "user");
-            msg.put("content", content.asText());
-            out.add(msg);
+            addUserText(out, content.asText());
             return;
         }
 
         if (!content.isArray()) {
-            ObjectNode msg = mapper.createObjectNode();
-            msg.put("role", "user");
-            msg.put("content", contentToText(content));
-            out.add(msg);
+            addUserText(out, contentToText(content));
             return;
         }
 
+        List<ObjectNode> toolMessages = new ArrayList<>();
         StringBuilder userText = new StringBuilder();
 
         for (JsonNode block : content) {
             String type = block.path("type").asText();
 
             if ("tool_result".equals(type)) {
-                flushUserText(userText, out);
-
                 ObjectNode toolMsg = mapper.createObjectNode();
                 toolMsg.put("role", "tool");
                 toolMsg.put("tool_call_id", block.path("tool_use_id").asText());
-                toolMsg.put("content", contentToText(block.get("content")));
-                out.add(toolMsg);
+
+                String toolContent = contentToText(block.get("content"));
+                if (block.path("is_error").asBoolean(false)) {
+                    toolContent = "Tool execution failed:\\n" + toolContent;
+                }
+
+                toolMsg.put("content", toolContent == null ? "" : toolContent);
+                toolMessages.add(toolMsg);
             } else if ("text".equals(type)) {
-                if (!userText.isEmpty()) {
-                    userText.append("\n");
-                }
-                userText.append(block.path("text").asText());
+                appendText(userText, block.path("text").asText());
             } else {
-                if (!userText.isEmpty()) {
-                    userText.append("\n");
-                }
-                userText.append(contentToText(block));
+                appendText(userText, contentToText(block));
             }
         }
 
-        flushUserText(userText, out);
+        for (ObjectNode toolMsg : toolMessages) {
+            out.add(toolMsg);
+        }
+
+        if (userText.length() > 0) {
+            addUserText(out, userText.toString());
+        }
+
+        if (toolMessages.isEmpty() && userText.length() == 0) {
+            addUserText(out, "");
+        }
     }
 
-    private void flushUserText(StringBuilder userText, ArrayNode out) {
-        if (!userText.isEmpty()) {
-            ObjectNode msg = mapper.createObjectNode();
-            msg.put("role", "user");
-            msg.put("content", userText.toString());
-            out.add(msg);
-            userText.setLength(0);
+    private void addUserText(ArrayNode out, String text) {
+        ObjectNode msg = mapper.createObjectNode();
+        msg.put("role", "user");
+        msg.put("content", text == null ? "" : text);
+        out.add(msg);
+    }
+
+    private void appendText(StringBuilder sb, String text) {
+        if (text == null || text.isEmpty()) {
+            return;
         }
+
+        if (sb.length() > 0) {
+            sb.append("\n");
+        }
+
+        sb.append(text);
     }
 
     /**
@@ -272,10 +349,7 @@ public class AnthropicDeepSeekProxyController {
                 String type = block.path("type").asText();
 
                 if ("text".equals(type)) {
-                    if (!text.isEmpty()) {
-                        text.append("\n");
-                    }
-                    text.append(block.path("text").asText());
+                    appendText(text, block.path("text").asText());
                 } else if ("tool_use".equals(type)) {
                     ObjectNode toolCall = mapper.createObjectNode();
                     toolCall.put("id", block.path("id").asText());
@@ -290,14 +364,14 @@ public class AnthropicDeepSeekProxyController {
                 }
             }
         } else {
-            text.append(contentToText(content));
+            appendText(text, contentToText(content));
         }
 
-        if (!text.isEmpty()) {
-            msg.put("content", text.toString());
-        } else {
-            msg.putNull("content");
-        }
+        /*
+         * 很多 OpenAI 兼容服务对 content=null 支持不好。
+         * 这里统一用空字符串，兼容性更好。
+         */
+        msg.put("content", text.length() > 0 ? text.toString() : "");
 
         if (!toolCalls.isEmpty()) {
             msg.set("tool_calls", toolCalls);
@@ -323,7 +397,7 @@ public class AnthropicDeepSeekProxyController {
                 function.put("description", anthropicTool.path("description").asText());
             }
 
-            if (anthropicTool.has("input_schema")) {
+            if (anthropicTool.has("input_schema") && anthropicTool.get("input_schema").isObject()) {
                 function.set("parameters", anthropicTool.get("input_schema"));
             } else {
                 ObjectNode parameters = mapper.createObjectNode();
@@ -441,32 +515,81 @@ public class AnthropicDeepSeekProxyController {
                 anthropicRequest.path("model").asText(properties.getDeepseekModel())
         );
 
-        Flux<ServerSentEvent<String>> start = Flux.just(
-                sse("message_start", state.messageStart())
-        );
-
-        Flux<ServerSentEvent<String>> body = deepseekClient.post()
+        return deepseekClient.post()
                 .uri("/chat/completions")
                 .contentType(MediaType.APPLICATION_JSON)
                 .accept(MediaType.TEXT_EVENT_STREAM)
                 .bodyValue(deepseekPayload)
-                .retrieve()
-                .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {
+                .exchangeToFlux(response -> {
+                    HttpStatusCode status = response.statusCode();
+
+                    if (status.isError()) {
+                        return response.bodyToMono(String.class)
+                                .defaultIfEmpty("")
+                                .flatMapMany(body -> {
+                                    log.error(
+                                            "DeepSeek upstream stream error, status={}, body={}, payload={}",
+                                            status,
+                                            limit(body, 4000),
+                                            limit(toJsonString(deepseekPayload), 8000)
+                                    );
+
+                                    return Flux.just(
+                                            sse("error", anthropicErrorResponse(
+                                                    "upstream_error",
+                                                    "DeepSeek upstream returned " + status + ": " + limit(body, 2000)
+                                            ))
+                                    );
+                                });
+                    }
+
+                    Flux<ServerSentEvent<String>> start = Flux.just(
+                            sse("message_start", state.messageStart())
+                    );
+
+                    Flux<ServerSentEvent<String>> body = response
+                            .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {
+                            })
+                            .filter(event -> event.data() != null)
+                            .concatMap(event ->
+                                    Flux.fromIterable(state.onDeepSeekSseData(event.data()))
+                            );
+
+                    Flux<ServerSentEvent<String>> end = Flux.defer(() ->
+                            Flux.fromIterable(state.finishEvents())
+                    );
+
+                    return start.concatWith(body).concatWith(end);
                 })
-                .filter(event -> event.data() != null)
-                .concatMap(event -> Flux.fromIterable(state.onDeepSeekSseData(event.data())));
+                .onErrorResume(e -> {
+                    log.error("Proxy stream request failed, payload={}",
+                            limit(toJsonString(deepseekPayload), 8000), e);
 
-        Flux<ServerSentEvent<String>> end = Flux.defer(() ->
-                Flux.fromIterable(state.finishEvents())
-        );
-
-        return start.concatWith(body).concatWith(end);
+                    return Flux.just(
+                            sse("error", anthropicErrorResponse(
+                                    "proxy_error",
+                                    "Proxy stream request failed: " + e.getMessage()
+                            ))
+                    );
+                });
     }
 
     private ServerSentEvent<String> sse(String eventName, JsonNode data) {
         return ServerSentEvent.<String>builder(toJsonString(data))
                 .event(eventName)
                 .build();
+    }
+
+    private ObjectNode anthropicErrorResponse(String type, String message) {
+        ObjectNode result = mapper.createObjectNode();
+        result.put("type", "error");
+
+        ObjectNode error = mapper.createObjectNode();
+        error.put("type", type == null || type.isBlank() ? "api_error" : type);
+        error.put("message", message == null ? "" : message);
+
+        result.set("error", error);
+        return result;
     }
 
     private String contentToText(JsonNode content) {
@@ -482,18 +605,25 @@ public class AnthropicDeepSeekProxyController {
             StringBuilder sb = new StringBuilder();
 
             for (JsonNode block : content) {
+                if (block == null || block.isNull()) {
+                    continue;
+                }
+
+                if (block.isTextual()) {
+                    appendText(sb, block.asText());
+                    continue;
+                }
+
                 String type = block.path("type").asText();
 
                 if ("text".equals(type)) {
-                    if (!sb.isEmpty()) {
-                        sb.append("\n");
-                    }
-                    sb.append(block.path("text").asText());
-                } else if (block.isTextual()) {
-                    if (!sb.isEmpty()) {
-                        sb.append("\n");
-                    }
-                    sb.append(block.asText());
+                    appendText(sb, block.path("text").asText());
+                } else if (block.has("text")) {
+                    appendText(sb, block.path("text").asText());
+                } else if (block.has("content")) {
+                    appendText(sb, contentToText(block.get("content")));
+                } else {
+                    appendText(sb, toJsonString(block));
                 }
             }
 
@@ -549,6 +679,18 @@ public class AnthropicDeepSeekProxyController {
         }
 
         return s;
+    }
+
+    private String limit(String text, int max) {
+        if (text == null) {
+            return "";
+        }
+
+        if (text.length() <= max) {
+            return text;
+        }
+
+        return text.substring(0, max) + "...[truncated]";
     }
 
     private int countTextChars(JsonNode node) {
@@ -626,6 +768,10 @@ public class AnthropicDeepSeekProxyController {
         List<ServerSentEvent<String>> onDeepSeekSseData(String rawData) {
             List<ServerSentEvent<String>> events = new ArrayList<>();
 
+            if (rawData == null || rawData.isBlank()) {
+                return events;
+            }
+
             String data = rawData.trim();
 
             if (data.startsWith("data:")) {
@@ -640,6 +786,7 @@ public class AnthropicDeepSeekProxyController {
             try {
                 root = mapper.readTree(data);
             } catch (Exception e) {
+                log.warn("Ignore invalid upstream SSE data: {}", limit(data, 1000));
                 return events;
             }
 
@@ -700,6 +847,14 @@ public class AnthropicDeepSeekProxyController {
                         toolBlocks.put(openAiToolIndex, block);
 
                         events.add(sse("content_block_start", contentBlockStartTool(block)));
+                    } else {
+                        JsonNode function = toolCallDelta.path("function");
+                        if (function.has("name") && function.get("name").isTextual()) {
+                            String newName = function.get("name").asText();
+                            if (!newName.isBlank()) {
+                                block.name = newName;
+                            }
+                        }
                     }
 
                     JsonNode function = toolCallDelta.path("function");

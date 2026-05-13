@@ -10,3 +10,14 @@ proxy:
 
   # 实际转发给内部 DeepSeek 的模型名
   deepseek-model: "deepseek-v31-t-yscku"
+
+  # 可选：如果上游限制 max_tokens，建议先设 8192 或 4096
+  # 如果你的上游允许更大，可以删掉或改大
+  max-tokens-limit: 8192
+
+  # 如果上游支持 function calling / tools，保持 true
+  # 如果仍然 400，并且错误提示不支持 tools，可以改成 false
+  forward-tools: true
+
+  # 如果仍然 400，并且错误提示跟 tool_choice 有关，可以改成 false
+  forward-tool-choice: true
