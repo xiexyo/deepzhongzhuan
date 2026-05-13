@@ -47,14 +47,18 @@ public class AnthropicDeepSeekProxyController {
 
     @GetMapping("/health")
     public Map<String, Object> health() {
-        return Map.of(
-                "status", "ok",
-                "upstream", properties.getDeepseekBaseUrl(),
-                "model", properties.getDeepseekModel(),
-                "forwardTools", properties.isForwardTools(),
-                "forwardToolChoice", properties.isForwardToolChoice(),
-                "maxTokensLimit", properties.getMaxTokensLimit()
-        );
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "ok");
+        result.put("upstream", properties.getDeepseekBaseUrl());
+        result.put("model", properties.getDeepseekModel());
+        result.put("forwardTools", properties.isForwardTools());
+        result.put("forwardToolChoice", properties.isForwardToolChoice());
+        result.put("forwardStopSequences", properties.isForwardStopSequences());
+        result.put("includeUsage", properties.isIncludeUsage());
+        result.put("defaultMaxTokens", properties.getDefaultMaxTokens());
+        result.put("maxTokensLimit", properties.getMaxTokensLimit());
+        result.put("logStreamChunks", properties.isLogStreamChunks());
+        return result;
     }
 
     /**
@@ -67,11 +71,13 @@ public class AnthropicDeepSeekProxyController {
         if (stream) {
             Flux<ServerSentEvent<String>> flux = streamMessages(anthropicRequest);
 
-            return Mono.just(
-                    ResponseEntity.ok()
-                            .contentType(MediaType.TEXT_EVENT_STREAM)
-                            .body(flux)
-            );
+            ResponseEntity<Flux<ServerSentEvent<String>>> entity = ResponseEntity.ok()
+                    .header("Cache-Control", "no-cache, no-transform")
+                    .header("X-Accel-Buffering", "no")
+                    .contentType(MediaType.TEXT_EVENT_STREAM)
+                    .body(flux);
+
+            return Mono.just((ResponseEntity<?>) entity);
         }
 
         ObjectNode deepseekPayload = toDeepSeekPayload(anthropicRequest, false);
@@ -127,7 +133,7 @@ public class AnthropicDeepSeekProxyController {
                     );
 
                     return Mono.just(
-                            ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                            (ResponseEntity<?>) ResponseEntity.status(HttpStatus.BAD_GATEWAY)
                                     .contentType(MediaType.APPLICATION_JSON)
                                     .body(error)
                     );
@@ -157,16 +163,31 @@ public class AnthropicDeepSeekProxyController {
         payload.put("model", properties.getDeepseekModel());
         payload.put("stream", stream);
 
-        if (anthropicRequest.has("max_tokens")) {
-            JsonNode maxTokensNode = anthropicRequest.get("max_tokens");
-            Integer limit = properties.getMaxTokensLimit();
+        /*
+         * max_tokens 处理
+         *
+         * Claude Code / VSCode 写代码时，如果 max_tokens 太小，会表现为输出几个字就断。
+         */
+        int maxTokens = 4096;
 
-            if (limit != null && limit > 0 && maxTokensNode.canConvertToInt()) {
-                payload.put("max_tokens", Math.min(maxTokensNode.asInt(), limit));
-            } else {
-                payload.set("max_tokens", maxTokensNode);
-            }
+        if (properties.getDefaultMaxTokens() != null && properties.getDefaultMaxTokens() > 0) {
+            maxTokens = properties.getDefaultMaxTokens();
         }
+
+        if (anthropicRequest.has("max_tokens") && anthropicRequest.get("max_tokens").canConvertToInt()) {
+            maxTokens = anthropicRequest.get("max_tokens").asInt(maxTokens);
+        }
+
+        Integer limit = properties.getMaxTokensLimit();
+        if (limit != null && limit > 0) {
+            maxTokens = Math.min(maxTokens, limit);
+        }
+
+        if (maxTokens <= 0) {
+            maxTokens = 4096;
+        }
+
+        payload.put("max_tokens", maxTokens);
 
         if (anthropicRequest.has("temperature")) {
             payload.set("temperature", anthropicRequest.get("temperature"));
@@ -176,10 +197,28 @@ public class AnthropicDeepSeekProxyController {
             payload.set("top_p", anthropicRequest.get("top_p"));
         }
 
-        if (anthropicRequest.has("stop_sequences")
+        /*
+         * 重点：
+         * Claude/Anthropic 的 stop_sequences 不一定适合 DeepSeek。
+         * 对 Claude Code / VSCode 插件，建议默认不要转发。
+         */
+        boolean stopForwarded = properties.isForwardStopSequences()
+                && anthropicRequest.has("stop_sequences")
                 && anthropicRequest.get("stop_sequences").isArray()
-                && !anthropicRequest.get("stop_sequences").isEmpty()) {
+                && !anthropicRequest.get("stop_sequences").isEmpty();
+
+        if (stopForwarded) {
             payload.set("stop", anthropicRequest.get("stop_sequences"));
+        }
+
+        /*
+         * 部分 OpenAI-compatible 服务支持 stream_options.include_usage。
+         * 如果你的内网 DeepSeek 不支持，可以把 include-usage 设为 false。
+         */
+        if (stream && properties.isIncludeUsage()) {
+            ObjectNode streamOptions = mapper.createObjectNode();
+            streamOptions.put("include_usage", true);
+            payload.set("stream_options", streamOptions);
         }
 
         ArrayNode messages = mapper.createArrayNode();
@@ -215,6 +254,20 @@ public class AnthropicDeepSeekProxyController {
             }
         }
 
+        log.info(
+                "Forward to DeepSeek: stream={}, model={}, max_tokens={}, tools={}, stopForwarded={}, includeUsage={}",
+                stream,
+                properties.getDeepseekModel(),
+                maxTokens,
+                hasTools && properties.isForwardTools(),
+                stopForwarded,
+                stream && properties.isIncludeUsage()
+        );
+
+        if (log.isDebugEnabled()) {
+            log.debug("DeepSeek payload={}", limit(toJsonString(payload), 12000));
+        }
+
         return payload;
     }
 
@@ -244,10 +297,9 @@ public class AnthropicDeepSeekProxyController {
     /**
      * Anthropic user content 可能包含 tool_result。
      *
-     * 关键修复：
      * OpenAI / DeepSeek 要求 role=tool 的消息必须紧跟在带 tool_calls 的 assistant 消息后。
      * 所以如果一个 Anthropic user content 里同时有 text 和 tool_result，
-     * 必须先输出 tool 消息，再输出普通 user 文本。
+     * 这里先输出 tool 消息，再输出普通 user 文本。
      */
     private void appendUserMessage(JsonNode content, ArrayNode out) {
         if (content == null || content.isNull()) {
@@ -501,6 +553,13 @@ public class AnthropicDeepSeekProxyController {
         usage.put("output_tokens", deepseekResponse.path("usage").path("completion_tokens").asInt(0));
         result.set("usage", usage);
 
+        log.info(
+                "DeepSeek non-stream finished: finish_reason={}, input_tokens={}, output_tokens={}",
+                finishReason,
+                usage.path("input_tokens").asInt(0),
+                usage.path("output_tokens").asInt(0)
+        );
+
         return result;
     }
 
@@ -551,9 +610,29 @@ public class AnthropicDeepSeekProxyController {
                             .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {
                             })
                             .filter(event -> event.data() != null)
-                            .concatMap(event ->
-                                    Flux.fromIterable(state.onDeepSeekSseData(event.data()))
-                            );
+                            .concatMap(event -> {
+                                String data = event.data();
+
+                                if (properties.isLogStreamChunks()) {
+                                    log.info("DeepSeek stream chunk: {}", limit(data, 4000));
+                                }
+
+                                return Flux.fromIterable(state.onDeepSeekSseData(data));
+                            })
+                            .onErrorResume(e -> {
+                                log.error(
+                                        "DeepSeek upstream stream body failed, payload={}",
+                                        limit(toJsonString(deepseekPayload), 8000),
+                                        e
+                                );
+
+                                /*
+                                 * 流已经开始后，不建议直接抛 error。
+                                 * Claude VSCode 插件更容易表现为“截断”。
+                                 * 这里尽量补齐 message_stop。
+                                 */
+                                return Flux.fromIterable(state.finishEvents());
+                            });
 
                     Flux<ServerSentEvent<String>> end = Flux.defer(() ->
                             Flux.fromIterable(state.finishEvents())
@@ -562,7 +641,7 @@ public class AnthropicDeepSeekProxyController {
                     return start.concatWith(body).concatWith(end);
                 })
                 .onErrorResume(e -> {
-                    log.error("Proxy stream request failed, payload={}",
+                    log.error("Proxy stream request failed before upstream response, payload={}",
                             limit(toJsonString(deepseekPayload), 8000), e);
 
                     return Flux.just(
@@ -727,13 +806,15 @@ public class AnthropicDeepSeekProxyController {
         private final String model;
         private final String messageId;
 
-        private boolean textStarted = false;
-        private boolean textStopped = false;
-        private int textIndex = -1;
+        private boolean textBlockOpen = false;
+        private int currentTextIndex = -1;
 
         private int nextContentIndex = 0;
         private String finishReason = "stop";
+        private int inputTokens = 0;
         private int outputTokens = 0;
+
+        private boolean finished = false;
 
         private final Map<Integer, ToolBlock> toolBlocks = new LinkedHashMap<>();
 
@@ -792,6 +873,7 @@ public class AnthropicDeepSeekProxyController {
 
             JsonNode usage = root.path("usage");
             if (usage.isObject()) {
+                inputTokens = usage.path("prompt_tokens").asInt(inputTokens);
                 outputTokens = usage.path("completion_tokens").asInt(outputTokens);
             }
 
@@ -805,67 +887,103 @@ public class AnthropicDeepSeekProxyController {
             if (!choice.path("finish_reason").isMissingNode()
                     && !choice.path("finish_reason").isNull()) {
                 finishReason = choice.path("finish_reason").asText("stop");
+
+                log.info(
+                        "DeepSeek stream finish_reason={}, input_tokens={}, output_tokens={}",
+                        finishReason,
+                        inputTokens,
+                        outputTokens
+                );
             }
 
             JsonNode delta = choice.path("delta");
 
+            /*
+             * 普通文本流
+             */
             if (delta.has("content") && delta.get("content").isTextual()) {
                 String text = delta.get("content").asText();
 
                 if (!text.isEmpty()) {
-                    if (!textStarted) {
-                        textStarted = true;
-                        textIndex = nextContentIndex++;
-
-                        events.add(sse("content_block_start", contentBlockStartText(textIndex)));
+                    if (!textBlockOpen) {
+                        currentTextIndex = nextContentIndex++;
+                        textBlockOpen = true;
+                        events.add(sse("content_block_start", contentBlockStartText(currentTextIndex)));
                     }
 
-                    events.add(sse("content_block_delta", contentBlockDeltaText(textIndex, text)));
+                    events.add(sse("content_block_delta", contentBlockDeltaText(currentTextIndex, text)));
                 }
             }
 
+            /*
+             * DeepSeek Reasoner 有些实现会返回 reasoning_content。
+             * Claude Code 主要需要最终代码输出，这里默认不转发 reasoning_content。
+             * 如果你想看推理内容，可以把它拼到 text 里，但不建议给 Claude Code 用。
+             */
+            if (delta.has("reasoning_content") && delta.get("reasoning_content").isTextual()) {
+                if (properties.isLogStreamChunks()) {
+                    log.info("Ignore reasoning_content chunk: {}",
+                            limit(delta.get("reasoning_content").asText(), 1000));
+                }
+            }
+
+            /*
+             * 工具调用流
+             */
             JsonNode toolCalls = delta.path("tool_calls");
             if (toolCalls.isArray()) {
-                if (textStarted && !textStopped) {
-                    textStopped = true;
-                    events.add(sse("content_block_stop", contentBlockStop(textIndex)));
-                }
+                closeTextBlockIfOpen(events);
 
                 for (JsonNode toolCallDelta : toolCalls) {
                     int openAiToolIndex = toolCallDelta.path("index").asInt(0);
 
                     ToolBlock block = toolBlocks.get(openAiToolIndex);
                     if (block == null) {
-                        String id = toolCallDelta.path("id").asText("toolu_" + UUID.randomUUID());
-                        String name = toolCallDelta.path("function").path("name").asText("unknown_tool");
-
                         block = new ToolBlock();
-                        block.index = nextContentIndex++;
-                        block.id = id;
-                        block.name = name;
-
+                        block.openAiIndex = openAiToolIndex;
+                        block.id = toolCallDelta.path("id").asText("");
                         toolBlocks.put(openAiToolIndex, block);
+                    }
 
-                        events.add(sse("content_block_start", contentBlockStartTool(block)));
-                    } else {
-                        JsonNode function = toolCallDelta.path("function");
-                        if (function.has("name") && function.get("name").isTextual()) {
-                            String newName = function.get("name").asText();
-                            if (!newName.isBlank()) {
-                                block.name = newName;
-                            }
+                    if (toolCallDelta.has("id") && toolCallDelta.get("id").isTextual()) {
+                        String id = toolCallDelta.get("id").asText();
+                        if (!id.isBlank()) {
+                            block.id = id;
                         }
                     }
 
                     JsonNode function = toolCallDelta.path("function");
+
+                    if (function.has("name") && function.get("name").isTextual()) {
+                        String newName = function.get("name").asText();
+                        if (!newName.isBlank()) {
+                            block.name = newName;
+                        }
+                    }
+
+                    /*
+                     * 如果 name 已经拿到了，就可以开始 Anthropic content_block_start。
+                     * 避免过早发 unknown_tool。
+                     */
+                    if (!block.started && block.name != null && !block.name.isBlank()) {
+                        startToolBlock(events, block);
+                    }
+
                     if (function.has("arguments") && function.get("arguments").isTextual()) {
                         String partialJson = function.get("arguments").asText();
 
                         if (!partialJson.isEmpty()) {
-                            events.add(sse(
-                                    "content_block_delta",
-                                    contentBlockDeltaToolJson(block.index, partialJson)
-                            ));
+                            if (block.started) {
+                                events.add(sse(
+                                        "content_block_delta",
+                                        contentBlockDeltaToolJson(block.index, partialJson)
+                                ));
+                            } else {
+                                /*
+                                 * 极端情况：arguments 先于 name 到达，先缓存。
+                                 */
+                                block.pendingArgumentDeltas.add(partialJson);
+                            }
                         }
                     }
                 }
@@ -875,14 +993,25 @@ public class AnthropicDeepSeekProxyController {
         }
 
         List<ServerSentEvent<String>> finishEvents() {
-            List<ServerSentEvent<String>> events = new ArrayList<>();
-
-            if (textStarted && !textStopped) {
-                textStopped = true;
-                events.add(sse("content_block_stop", contentBlockStop(textIndex)));
+            if (finished) {
+                return Collections.emptyList();
             }
 
+            finished = true;
+
+            List<ServerSentEvent<String>> events = new ArrayList<>();
+
+            closeTextBlockIfOpen(events);
+
             for (ToolBlock block : toolBlocks.values()) {
+                if (!block.started) {
+                    if (block.name == null || block.name.isBlank()) {
+                        block.name = "unknown_tool";
+                    }
+
+                    startToolBlock(events, block);
+                }
+
                 if (!block.stopped) {
                     block.stopped = true;
                     events.add(sse("content_block_stop", contentBlockStop(block.index)));
@@ -893,6 +1022,44 @@ public class AnthropicDeepSeekProxyController {
             events.add(sse("message_stop", messageStop()));
 
             return events;
+        }
+
+        private void closeTextBlockIfOpen(List<ServerSentEvent<String>> events) {
+            if (textBlockOpen) {
+                events.add(sse("content_block_stop", contentBlockStop(currentTextIndex)));
+                textBlockOpen = false;
+                currentTextIndex = -1;
+            }
+        }
+
+        private void startToolBlock(List<ServerSentEvent<String>> events, ToolBlock block) {
+            if (block.started) {
+                return;
+            }
+
+            block.started = true;
+            block.index = nextContentIndex++;
+
+            if (block.id == null || block.id.isBlank()) {
+                block.id = "toolu_" + UUID.randomUUID();
+            }
+
+            if (block.name == null || block.name.isBlank()) {
+                block.name = "unknown_tool";
+            }
+
+            events.add(sse("content_block_start", contentBlockStartTool(block)));
+
+            if (!block.pendingArgumentDeltas.isEmpty()) {
+                for (String pending : block.pendingArgumentDeltas) {
+                    events.add(sse(
+                            "content_block_delta",
+                            contentBlockDeltaToolJson(block.index, pending)
+                    ));
+                }
+
+                block.pendingArgumentDeltas.clear();
+            }
         }
 
         private JsonNode contentBlockStartText(int index) {
@@ -981,9 +1148,12 @@ public class AnthropicDeepSeekProxyController {
     }
 
     private static class ToolBlock {
-        int index;
+        int openAiIndex;
+        int index = -1;
         String id;
         String name;
+        boolean started = false;
         boolean stopped = false;
+        List<String> pendingArgumentDeltas = new ArrayList<>();
     }
 }

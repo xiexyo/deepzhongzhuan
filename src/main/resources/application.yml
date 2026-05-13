@@ -21,3 +21,12 @@ proxy:
 
   # 如果仍然 400，并且错误提示跟 tool_choice 有关，可以改成 false
   forward-tool-choice: true
+
+  # 这个非常关键，建议先保持 false
+  forward-stop-sequences: false
+
+  # 如果上游不支持 stream_options，再改成 false
+  include-usage: true
+
+  # 排查截断时可以临时改 true
+  log-stream-chunks: false

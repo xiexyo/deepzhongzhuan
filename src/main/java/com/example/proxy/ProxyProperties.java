@@ -21,23 +21,71 @@ public class ProxyProperties {
     private String deepseekModel;
 
     /**
-     * 可选：限制 max_tokens，避免 Claude Code 传入过大的 max_tokens 导致上游 400。
-     * 如果为 null，则不限制。
+     * 如果 Claude / VSCode 插件没有传 max_tokens，则使用这个默认值。
+     *
+     * 写代码场景不要太小，建议 4096 或 8192。
      */
-    private Integer maxTokensLimit;
+    private Integer defaultMaxTokens = 4096;
+
+    /**
+     * 可选：限制 max_tokens，避免 Claude Code 传入过大的 max_tokens 导致上游 400。
+     *
+     * 如果为 null，则不限制。
+     *
+     * 建议：
+     * - 普通代码场景：8192
+     * - 上游支持长输出：16384
+     */
+    private Integer maxTokensLimit = 8192;
 
     /**
      * 是否转发 tools。
+     *
+     * Claude Code / VSCode 插件写代码时通常需要 tools，
+     * 所以建议 true。
+     *
      * 如果你的上游 OpenAI 兼容接口不支持 tools，可以改成 false。
      */
     private boolean forwardTools = true;
 
     /**
      * 是否转发 tool_choice。
+     *
      * 有些 OpenAI 兼容服务支持 tools，但不支持 tool_choice=required/none。
-     * 如果仍然 400，可以先把这个设为 false。
+     * 如果上游 400，可以先把这个设为 false。
      */
     private boolean forwardToolChoice = true;
+
+    /**
+     * 是否转发 Anthropic stop_sequences 到 OpenAI/DeepSeek stop。
+     *
+     * 重点：
+     * Claude/Anthropic 的 stop_sequences 不一定适合 DeepSeek。
+     * VSCode 插件里出现“输出几个字符就截断”，经常和 stop_sequences 有关。
+     *
+     * 建议默认 false。
+     */
+    private boolean forwardStopSequences = false;
+
+    /**
+     * 流式请求时是否加：
+     *
+     * stream_options: {
+     *   include_usage: true
+     * }
+     *
+     * 有些 OpenAI-compatible 服务不支持这个字段。
+     * 如果上游报 400，就改成 false。
+     */
+    private boolean includeUsage = true;
+
+    /**
+     * 是否打印上游流式 chunk。
+     *
+     * 排查截断问题时可以临时开 true。
+     * 正常使用建议 false，避免日志过大。
+     */
+    private boolean logStreamChunks = false;
 
     public String getDeepseekBaseUrl() {
         return deepseekBaseUrl;
@@ -63,6 +111,14 @@ public class ProxyProperties {
         this.deepseekModel = deepseekModel;
     }
 
+    public Integer getDefaultMaxTokens() {
+        return defaultMaxTokens;
+    }
+
+    public void setDefaultMaxTokens(Integer defaultMaxTokens) {
+        this.defaultMaxTokens = defaultMaxTokens;
+    }
+
     public Integer getMaxTokensLimit() {
         return maxTokensLimit;
     }
@@ -85,5 +141,29 @@ public class ProxyProperties {
 
     public void setForwardToolChoice(boolean forwardToolChoice) {
         this.forwardToolChoice = forwardToolChoice;
+    }
+
+    public boolean isForwardStopSequences() {
+        return forwardStopSequences;
+    }
+
+    public void setForwardStopSequences(boolean forwardStopSequences) {
+        this.forwardStopSequences = forwardStopSequences;
+    }
+
+    public boolean isIncludeUsage() {
+        return includeUsage;
+    }
+
+    public void setIncludeUsage(boolean includeUsage) {
+        this.includeUsage = includeUsage;
+    }
+
+    public boolean isLogStreamChunks() {
+        return logStreamChunks;
+    }
+
+    public void setLogStreamChunks(boolean logStreamChunks) {
+        this.logStreamChunks = logStreamChunks;
     }
 }
