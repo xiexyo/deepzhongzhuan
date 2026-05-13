@@ -1,6 +1,10 @@
 server:
   port: 8080
 
+spring:
+  codec:
+    max-in-memory-size: 32MB
+
 proxy:
   # 你的内部 DeepSeek-V4 / OpenAI 兼容服务地址，注意这里填到 /v1
   deepseek-base-url: "http://10.0.37.102/v1"
@@ -11,22 +15,66 @@ proxy:
   # 实际转发给内部 DeepSeek 的模型名
   deepseek-model: "deepseek-v31-t-yscku"
 
-  # 可选：如果上游限制 max_tokens，建议先设 8192 或 4096
-  # 如果你的上游允许更大，可以删掉或改大
+  # 如果 Claude / VSCode 插件没有传 max_tokens，则使用这个默认值
+  # 写代码、写文档建议不要太小
+  default-max-tokens: 8192
+
+  # 限制 max_tokens，避免 Claude Code 传入过大的 max_tokens 导致上游 400
+  # 如果上游支持更长输出，可以改成 16384
   max-tokens-limit: 8192
 
   # 如果上游支持 function calling / tools，保持 true
-  # 如果仍然 400，并且错误提示不支持 tools，可以改成 false
+  # Claude Code / VSCode 插件建议 true
   forward-tools: true
 
-  # 如果仍然 400，并且错误提示跟 tool_choice 有关，可以改成 false
+  # 如果上游支持 tool_choice，保持 true
+  # 如果上游 400 且错误提示跟 tool_choice 有关，可以改成 false
   forward-tool-choice: true
 
-  # 这个非常关键，建议先保持 false
+  # 这个非常关键，建议保持 false
+  # Anthropic 的 stop_sequences 直接转给 DeepSeek 容易导致提前停止
   forward-stop-sequences: false
 
-  # 如果上游不支持 stream_options，再改成 false
+  # 是否给流式请求加：
+  # stream_options:
+  #   include_usage: true
+  #
+  # 如果上游报 unknown field stream_options，就改成 false
   include-usage: true
 
-  # 排查截断时可以临时改 true
+  # 排查流式截断、换行、reasoning_content 时可以临时改 true
+  # 正常使用建议 false，避免日志太大
   log-stream-chunks: false
+
+  # =========================
+  # DeepSeek 思考模式配置
+  # =========================
+
+  # 思考模式开关：
+  #
+  # disabled：代理显式关闭 DeepSeek thinking，最稳定，推荐默认
+  # enabled：代理显式开启 DeepSeek thinking
+  # auto：代理不传 thinking 参数，使用 DeepSeek 默认行为
+  #
+  # 建议默认 disabled。
+  # 因为 Claude Code / VSCode 插件不一定每次都能正确保留 thinking block。
+  thinking-type: enabled
+
+  # 普通请求的思考强度
+  #
+  # DeepSeek 文档支持 high / max
+  # low、medium 会映射为 high
+  # xhigh 会映射为 max
+  reasoning-effort: high
+
+  # Agent / Claude Code / tools 场景下默认思考强度
+  #
+  # 如果开启 thinking，Claude Code / tools 场景建议 max
+  agent-reasoning-effort: max
+
+  # 是否把 DeepSeek reasoning_content 暴露成 Anthropic thinking block
+  #
+  # 如果 thinking-type: enabled，并且使用 tools，建议 true。
+  # 因为 DeepSeek 文档要求：
+  # thinking + tool call 场景，后续请求必须完整回传 reasoning_content。
+  expose-thinking: true

@@ -86,7 +86,68 @@ public class ProxyProperties {
      * 正常使用建议 false，避免日志过大。
      */
     private boolean logStreamChunks = false;
+    /**
+     * 思考模式：
+     *
+     * disabled：代理显式关闭 DeepSeek thinking，最稳，推荐默认
+     * enabled：代理显式开启 DeepSeek thinking
+     * auto：不传 thinking 参数，使用 DeepSeek 默认行为
+     */
+    private String thinkingType = "disabled";
 
+    /**
+     * 普通请求思考强度。
+     *
+     * DeepSeek 文档支持 high / max。
+     * low / medium 会按 high 处理。
+     * xhigh 会按 max 处理。
+     */
+    private String reasoningEffort = "high";
+
+    /**
+     * Agent / Claude Code / tools 场景下默认思考强度。
+     */
+    private String agentReasoningEffort = "max";
+
+    /**
+     * 是否把 DeepSeek reasoning_content 暴露成 Anthropic thinking block。
+     *
+     * 如果 thinking enabled，建议 true。
+     * 如果 false，则只给用户最终答案。
+     */
+    private boolean exposeThinking = true;
+
+    public String getThinkingType() {
+        return thinkingType;
+    }
+
+    public void setThinkingType(String thinkingType) {
+        this.thinkingType = thinkingType;
+    }
+
+    public String getReasoningEffort() {
+        return reasoningEffort;
+    }
+
+    public void setReasoningEffort(String reasoningEffort) {
+        this.reasoningEffort = reasoningEffort;
+    }
+
+    public String getAgentReasoningEffort() {
+        return agentReasoningEffort;
+    }
+
+    public void setAgentReasoningEffort(String agentReasoningEffort) {
+        this.agentReasoningEffort = agentReasoningEffort;
+    }
+
+    public boolean isExposeThinking() {
+        return exposeThinking;
+    }
+
+    public void setExposeThinking(boolean exposeThinking) {
+        this.exposeThinking = exposeThinking;
+    }
     public String getDeepseekBaseUrl() {
         return deepseekBaseUrl;
     }

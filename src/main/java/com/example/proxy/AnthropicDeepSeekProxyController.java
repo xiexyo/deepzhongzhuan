@@ -58,6 +58,10 @@ public class AnthropicDeepSeekProxyController {
         result.put("defaultMaxTokens", properties.getDefaultMaxTokens());
         result.put("maxTokensLimit", properties.getMaxTokensLimit());
         result.put("logStreamChunks", properties.isLogStreamChunks());
+        result.put("thinkingType", properties.getThinkingType());
+        result.put("reasoningEffort", properties.getReasoningEffort());
+        result.put("agentReasoningEffort", properties.getAgentReasoningEffort());
+        result.put("exposeThinking", properties.isExposeThinking());
         return result;
     }
 
@@ -167,7 +171,10 @@ public class AnthropicDeepSeekProxyController {
      */
     private ObjectNode toDeepSeekPayload(JsonNode anthropicRequest, boolean stream) {
         ObjectNode payload = mapper.createObjectNode();
+        ThinkingConfig thinking = resolveThinking(anthropicRequest);
 
+        payload.put("model", properties.getDeepseekModel());
+        payload.put("stream", stream);
         payload.put("model", properties.getDeepseekModel());
         payload.put("stream", stream);
 
@@ -198,12 +205,28 @@ public class AnthropicDeepSeekProxyController {
 
         payload.put("max_tokens", maxTokens);
 
-        if (anthropicRequest.has("temperature")) {
-            payload.set("temperature", anthropicRequest.get("temperature"));
-        }
+        /*
+         * DeepSeek 文档说明：
+         * 思考模式下 temperature、top_p、presence_penalty、frequency_penalty 不生效。
+         *
+         * 所以 thinking enabled 时不转发这些参数，避免误解。
+         */
+        if (!thinking.effectiveEnabled) {
+            if (anthropicRequest.has("temperature")) {
+                payload.set("temperature", anthropicRequest.get("temperature"));
+            }
 
-        if (anthropicRequest.has("top_p")) {
-            payload.set("top_p", anthropicRequest.get("top_p"));
+            if (anthropicRequest.has("top_p")) {
+                payload.set("top_p", anthropicRequest.get("top_p"));
+            }
+
+            if (anthropicRequest.has("presence_penalty")) {
+                payload.set("presence_penalty", anthropicRequest.get("presence_penalty"));
+            }
+
+            if (anthropicRequest.has("frequency_penalty")) {
+                payload.set("frequency_penalty", anthropicRequest.get("frequency_penalty"));
+            }
         }
 
         /*
@@ -245,7 +268,26 @@ public class AnthropicDeepSeekProxyController {
                 appendConvertedMessage(msg, messages);
             }
         }
+        /*
+         * DeepSeek thinking 参数。
+         *
+         * OpenAI 格式：
+         * {
+         *   "thinking": {
+         *     "type": "enabled"
+         *   },
+         *   "reasoning_effort": "high"
+         * }
+         */
+        if (thinking.sendThinkingParam) {
+            ObjectNode thinkingNode = mapper.createObjectNode();
+            thinkingNode.put("type", thinking.type);
+            payload.set("thinking", thinkingNode);
+        }
 
+        if (thinking.effectiveEnabled) {
+            payload.put("reasoning_effort", thinking.effort);
+        }
         payload.set("messages", messages);
 
         boolean hasTools = anthropicRequest.has("tools")
@@ -264,13 +306,16 @@ public class AnthropicDeepSeekProxyController {
         }
 
         log.info(
-                "Forward to DeepSeek: stream={}, model={}, max_tokens={}, tools={}, stopForwarded={}, includeUsage={}",
+                "Forward to DeepSeek: stream={}, model={}, max_tokens={}, tools={}, stopForwarded={}, includeUsage={}, thinking={}, effort={}, exposeThinking={}",
                 stream,
                 properties.getDeepseekModel(),
                 maxTokens,
                 hasTools && properties.isForwardTools(),
                 stopForwarded,
-                stream && properties.isIncludeUsage()
+                stream && properties.isIncludeUsage(),
+                thinking.type,
+                thinking.effort,
+                thinking.exposeThinking
         );
 
         if (log.isDebugEnabled()) {
@@ -397,6 +442,7 @@ public class AnthropicDeepSeekProxyController {
         msg.put("role", "assistant");
 
         StringBuilder text = new StringBuilder();
+        StringBuilder reasoning = new StringBuilder();
         ArrayNode toolCalls = mapper.createArrayNode();
 
         if (content == null || content.isNull()) {
@@ -414,9 +460,24 @@ public class AnthropicDeepSeekProxyController {
         if (content.isArray()) {
             for (JsonNode block : content) {
                 String type = block.path("type").asText();
-
                 if ("text".equals(type)) {
                     appendText(text, block.path("text").asText());
+                } else if ("thinking".equals(type)) {
+                    /*
+                     * Anthropic thinking block -> DeepSeek reasoning_content。
+                     *
+                     * 这对 thinking + tool call 的多轮场景很重要。
+                     */
+                    String thinkingText = block.path("thinking").asText("");
+                    if (thinkingText == null || thinkingText.isBlank()) {
+                        thinkingText = block.path("text").asText("");
+                    }
+                    appendText(reasoning, thinkingText);
+                } else if ("redacted_thinking".equals(type)) {
+                    /*
+                     * Anthropic 可能存在 redacted_thinking。
+                     * DeepSeek 无法使用，忽略。
+                     */
                 } else if ("tool_use".equals(type)) {
                     ObjectNode toolCall = mapper.createObjectNode();
                     toolCall.put("id", block.path("id").asText());
@@ -439,7 +500,9 @@ public class AnthropicDeepSeekProxyController {
          * 这里统一用空字符串，兼容性更好。
          */
         msg.put("content", text.length() > 0 ? text.toString() : "");
-
+        if (reasoning.length() > 0) {
+            msg.put("reasoning_content", reasoning.toString());
+        }
         if (!toolCalls.isEmpty()) {
             msg.set("tool_calls", toolCalls);
         }
@@ -534,6 +597,19 @@ public class AnthropicDeepSeekProxyController {
 
         JsonNode message = choice.path("message");
 
+        ThinkingConfig thinking = resolveThinking(anthropicRequest);
+
+        String reasoningContent = message.path("reasoning_content").asText("");
+        if (thinking.effectiveEnabled
+                && thinking.exposeThinking
+                && reasoningContent != null
+                && !reasoningContent.isBlank()) {
+            ObjectNode thinkingBlock = mapper.createObjectNode();
+            thinkingBlock.put("type", "thinking");
+            thinkingBlock.put("thinking", reasoningContent);
+            content.add(thinkingBlock);
+        }
+
         String text = message.path("content").asText("");
         if (text != null && !text.isBlank()) {
             ObjectNode textBlock = mapper.createObjectNode();
@@ -590,9 +666,12 @@ public class AnthropicDeepSeekProxyController {
     private Flux<String> streamMessages(JsonNode anthropicRequest) {
         ObjectNode deepseekPayload = toDeepSeekPayload(anthropicRequest, true);
 
+        ThinkingConfig thinking = resolveThinking(anthropicRequest);
+
         StreamState state = new StreamState(
                 mapper,
-                anthropicRequest.path("model").asText(properties.getDeepseekModel())
+                anthropicRequest.path("model").asText(properties.getDeepseekModel()),
+                thinking
         );
 
         return deepseekClient.post()
@@ -837,19 +916,18 @@ public class AnthropicDeepSeekProxyController {
         private final ObjectMapper mapper;
         private final String model;
         private final String messageId;
+        private final ThinkingConfig thinking;
+
+        private boolean thinkingBlockOpen = false;
+        private int currentThinkingIndex = -1;
+        private final StringBuilder pendingThinkingDelta = new StringBuilder();
 
         private boolean textBlockOpen = false;
         private int currentTextIndex = -1;
-
-        /*
-         * 合并小 token，避免 VSCode 插件显示成很碎的片段。
-         *
-         * 写代码/写文档都适用。
-         * 如果你希望响应更实时，可以调小，比如 16。
-         * 如果你希望更稳定，可以调大，比如 64。
-         */
         private final StringBuilder pendingTextDelta = new StringBuilder();
+
         private static final int TEXT_DELTA_FLUSH_CHARS = 32;
+        private static final int THINKING_DELTA_FLUSH_CHARS = 64;
 
         private int nextContentIndex = 0;
         private String finishReason = "stop";
@@ -860,9 +938,10 @@ public class AnthropicDeepSeekProxyController {
 
         private final Map<Integer, ToolBlock> toolBlocks = new LinkedHashMap<>();
 
-        StreamState(ObjectMapper mapper, String model) {
+        StreamState(ObjectMapper mapper, String model, ThinkingConfig thinking) {
             this.mapper = mapper;
             this.model = model;
+            this.thinking = thinking;
             this.messageId = "msg_" + UUID.randomUUID();
         }
 
@@ -941,14 +1020,37 @@ public class AnthropicDeepSeekProxyController {
             JsonNode delta = choice.path("delta");
 
             /*
-             * 普通文本流。
+             * DeepSeek thinking / reasoning_content。
+             */
+            if (delta.has("reasoning_content") && delta.get("reasoning_content").isTextual()) {
+                String reasoning = delta.get("reasoning_content").asText();
+
+                if (reasoning != null && !reasoning.isEmpty()) {
+                    if (thinking.effectiveEnabled && thinking.exposeThinking) {
+                        if (!thinkingBlockOpen) {
+                            currentThinkingIndex = nextContentIndex++;
+                            thinkingBlockOpen = true;
+                            events.add(sse("content_block_start", contentBlockStartThinking(currentThinkingIndex)));
+                        }
+
+                        appendThinkingDelta(events, reasoning);
+                    } else if (properties.isLogStreamChunks()) {
+                        log.info("Ignore reasoning_content chunk: {}", limit(reasoning, 1000));
+                    }
+                }
+            }
+
+            /*
+             * 最终文本 content。
              *
-             * 代码、Markdown 文档、README、接口说明、本质都走这里。
+             * 一旦开始输出最终文本，就关闭 thinking block。
              */
             if (delta.has("content") && delta.get("content").isTextual()) {
                 String text = delta.get("content").asText();
 
                 if (!text.isEmpty()) {
+                    closeThinkingBlockIfOpen(events);
+
                     if (!textBlockOpen) {
                         currentTextIndex = nextContentIndex++;
                         textBlockOpen = true;
@@ -960,21 +1062,13 @@ public class AnthropicDeepSeekProxyController {
             }
 
             /*
-             * DeepSeek Reasoner 有些实现会返回 reasoning_content。
-             * Claude Code 主要需要最终代码/文档输出，这里默认不转发 reasoning_content。
-             */
-            if (delta.has("reasoning_content") && delta.get("reasoning_content").isTextual()) {
-                if (properties.isLogStreamChunks()) {
-                    log.info("Ignore reasoning_content chunk: {}",
-                            limit(delta.get("reasoning_content").asText(), 1000));
-                }
-            }
-
-            /*
-             * 工具调用流。
+             * 工具调用。
+             *
+             * 一旦开始工具调用，也关闭 thinking block 和 text block。
              */
             JsonNode toolCalls = delta.path("tool_calls");
             if (toolCalls.isArray()) {
+                closeThinkingBlockIfOpen(events);
                 closeTextBlockIfOpen(events);
 
                 for (JsonNode toolCallDelta : toolCalls) {
@@ -1004,10 +1098,6 @@ public class AnthropicDeepSeekProxyController {
                         }
                     }
 
-                    /*
-                     * 如果 name 已经拿到了，就可以开始 Anthropic content_block_start。
-                     * 避免过早发 unknown_tool。
-                     */
                     if (!block.started && block.name != null && !block.name.isBlank()) {
                         startToolBlock(events, block);
                     }
@@ -1022,9 +1112,6 @@ public class AnthropicDeepSeekProxyController {
                                         contentBlockDeltaToolJson(block.index, partialJson)
                                 ));
                             } else {
-                                /*
-                                 * 极端情况：arguments 先于 name 到达，先缓存。
-                                 */
                                 block.pendingArgumentDeltas.add(partialJson);
                             }
                         }
@@ -1044,6 +1131,7 @@ public class AnthropicDeepSeekProxyController {
 
             List<String> events = new ArrayList<>();
 
+            closeThinkingBlockIfOpen(events);
             closeTextBlockIfOpen(events);
 
             for (ToolBlock block : toolBlocks.values()) {
@@ -1067,6 +1155,41 @@ public class AnthropicDeepSeekProxyController {
             return events;
         }
 
+        private void appendThinkingDelta(List<String> events, String text) {
+            if (text == null || text.isEmpty()) {
+                return;
+            }
+
+            pendingThinkingDelta.append(text);
+
+            if (pendingThinkingDelta.length() >= THINKING_DELTA_FLUSH_CHARS || text.contains("\n")) {
+                flushThinkingDelta(events);
+            }
+        }
+
+        private void flushThinkingDelta(List<String> events) {
+            if (pendingThinkingDelta.length() == 0) {
+                return;
+            }
+
+            events.add(sse(
+                    "content_block_delta",
+                    contentBlockDeltaThinking(currentThinkingIndex, pendingThinkingDelta.toString())
+            ));
+
+            pendingThinkingDelta.setLength(0);
+        }
+
+        private void closeThinkingBlockIfOpen(List<String> events) {
+            if (thinkingBlockOpen) {
+                flushThinkingDelta(events);
+
+                events.add(sse("content_block_stop", contentBlockStop(currentThinkingIndex)));
+                thinkingBlockOpen = false;
+                currentThinkingIndex = -1;
+            }
+        }
+
         private void appendTextDelta(List<String> events, String text) {
             if (text == null || text.isEmpty()) {
                 return;
@@ -1074,13 +1197,6 @@ public class AnthropicDeepSeekProxyController {
 
             pendingTextDelta.append(text);
 
-            /*
-             * 合并小 token。
-             *
-             * 遇到换行立即 flush：
-             * - 代码块不会延迟太久
-             * - Markdown 文档段落显示更自然
-             */
             if (pendingTextDelta.length() >= TEXT_DELTA_FLUSH_CHARS || text.contains("\n")) {
                 flushTextDelta(events);
             }
@@ -1137,6 +1253,32 @@ public class AnthropicDeepSeekProxyController {
 
                 block.pendingArgumentDeltas.clear();
             }
+        }
+
+        private JsonNode contentBlockStartThinking(int index) {
+            ObjectNode data = mapper.createObjectNode();
+            data.put("type", "content_block_start");
+            data.put("index", index);
+
+            ObjectNode block = mapper.createObjectNode();
+            block.put("type", "thinking");
+            block.put("thinking", "");
+
+            data.set("content_block", block);
+            return data;
+        }
+
+        private JsonNode contentBlockDeltaThinking(int index, String thinkingText) {
+            ObjectNode data = mapper.createObjectNode();
+            data.put("type", "content_block_delta");
+            data.put("index", index);
+
+            ObjectNode delta = mapper.createObjectNode();
+            delta.put("type", "thinking_delta");
+            delta.put("thinking", thinkingText);
+
+            data.set("delta", delta);
+            return data;
         }
 
         private JsonNode contentBlockStartText(int index) {
@@ -1232,5 +1374,125 @@ public class AnthropicDeepSeekProxyController {
         boolean started = false;
         boolean stopped = false;
         List<String> pendingArgumentDeltas = new ArrayList<>();
+    }
+
+    private static class ThinkingConfig {
+        String type;
+        String effort;
+        boolean sendThinkingParam;
+        boolean effectiveEnabled;
+        boolean exposeThinking;
+    }
+    private ThinkingConfig resolveThinking(JsonNode anthropicRequest) {
+        ThinkingConfig cfg = new ThinkingConfig();
+
+        String type = normalizeThinkingType(properties.getThinkingType());
+
+        /*
+         * 优先尊重 Anthropic 请求里的 thinking。
+         *
+         * 例如：
+         * {
+         *   "thinking": {
+         *     "type": "enabled"
+         *   }
+         * }
+         */
+        JsonNode thinkingNode = anthropicRequest.path("thinking");
+        if (thinkingNode.isObject()) {
+            String requestType = normalizeThinkingType(thinkingNode.path("type").asText(""));
+            if ("enabled".equals(requestType) || "disabled".equals(requestType)) {
+                type = requestType;
+            }
+        }
+
+        boolean hasTools = anthropicRequest.has("tools")
+                && anthropicRequest.get("tools").isArray()
+                && !anthropicRequest.get("tools").isEmpty();
+
+        /*
+         * Anthropic 格式思考强度：
+         * {
+         *   "output_config": {
+         *     "effort": "high"
+         *   }
+         * }
+         */
+        String effort = null;
+
+        JsonNode outputConfig = anthropicRequest.path("output_config");
+        if (outputConfig.isObject()) {
+            effort = outputConfig.path("effort").asText(null);
+        }
+
+        /*
+         * 兼容某些客户端直接传 reasoning_effort。
+         */
+        if (effort == null || effort.isBlank()) {
+            effort = anthropicRequest.path("reasoning_effort").asText(null);
+        }
+
+        if (effort == null || effort.isBlank()) {
+            effort = hasTools
+                    ? properties.getAgentReasoningEffort()
+                    : properties.getReasoningEffort();
+        }
+
+        effort = normalizeReasoningEffort(effort);
+
+        cfg.type = type;
+        cfg.effort = effort;
+        cfg.exposeThinking = properties.isExposeThinking();
+
+        /*
+         * disabled/enabled：显式发送 thinking 参数。
+         * auto：不发送 thinking 参数，使用 DeepSeek 默认行为。
+         */
+        cfg.sendThinkingParam = "enabled".equals(type) || "disabled".equals(type);
+
+        /*
+         * effectiveEnabled 用于决定是否处理 reasoning_content。
+         *
+         * auto 下，DeepSeek 默认是 enabled，所以这里按 true 处理。
+         */
+        cfg.effectiveEnabled = "enabled".equals(type) || "auto".equals(type);
+
+        return cfg;
+    }
+
+    private String normalizeThinkingType(String type) {
+        if (type == null || type.isBlank()) {
+            return "disabled";
+        }
+
+        String t = type.trim().toLowerCase(Locale.ROOT);
+
+        if ("enabled".equals(t) || "enable".equals(t) || "on".equals(t) || "true".equals(t)) {
+            return "enabled";
+        }
+
+        if ("disabled".equals(t) || "disable".equals(t) || "off".equals(t) || "false".equals(t)) {
+            return "disabled";
+        }
+
+        if ("auto".equals(t)) {
+            return "auto";
+        }
+
+        return "disabled";
+    }
+
+    private String normalizeReasoningEffort(String effort) {
+        if (effort == null || effort.isBlank()) {
+            return "high";
+        }
+
+        String e = effort.trim().toLowerCase(Locale.ROOT);
+
+        return switch (e) {
+            case "low", "medium", "high" -> "high";
+            case "xhigh", "max" -> "max";
+            default -> "high";
+        };
     }
 }
