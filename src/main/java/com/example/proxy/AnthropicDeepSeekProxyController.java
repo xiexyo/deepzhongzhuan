@@ -69,9 +69,17 @@ public class AnthropicDeepSeekProxyController {
         boolean stream = anthropicRequest.path("stream").asBoolean(false);
 
         if (stream) {
-            Flux<ServerSentEvent<String>> flux = streamMessages(anthropicRequest);
+            /*
+             * 重点：
+             * 这里不用 Flux<ServerSentEvent<String>> 返回给 Claude 插件，
+             * 而是手写 Anthropic SSE 文本格式。
+             *
+             * 有些 Claude VSCode 插件对 Spring 自动编码的 SSE 比较敏感，
+             * 可能导致显示成“一小段一行”。
+             */
+            Flux<String> flux = streamMessages(anthropicRequest);
 
-            ResponseEntity<Flux<ServerSentEvent<String>>> entity = ResponseEntity.ok()
+            ResponseEntity<Flux<String>> entity = ResponseEntity.ok()
                     .header("Cache-Control", "no-cache, no-transform")
                     .header("X-Accel-Buffering", "no")
                     .contentType(MediaType.TEXT_EVENT_STREAM)
@@ -164,9 +172,10 @@ public class AnthropicDeepSeekProxyController {
         payload.put("stream", stream);
 
         /*
-         * max_tokens 处理
+         * max_tokens 处理。
          *
-         * Claude Code / VSCode 写代码时，如果 max_tokens 太小，会表现为输出几个字就断。
+         * Claude Code / VSCode 写代码、写文档时，如果 max_tokens 太小，
+         * 会表现为输出很短或者提前停止。
          */
         int maxTokens = 4096;
 
@@ -337,6 +346,12 @@ public class AnthropicDeepSeekProxyController {
                 toolMessages.add(toolMsg);
             } else if ("text".equals(type)) {
                 appendText(userText, block.path("text").asText());
+            } else if ("image".equals(type)) {
+                /*
+                 * 你明确不需要 image 输入。
+                 * 这里直接忽略，避免把 base64 图片塞给 DeepSeek。
+                 */
+                appendText(userText, "[Image input ignored by proxy]");
             } else {
                 appendText(userText, contentToText(block));
             }
@@ -565,8 +580,14 @@ public class AnthropicDeepSeekProxyController {
 
     /**
      * 流式处理：OpenAI SSE -> Anthropic SSE
+     *
+     * 返回 Flux<String>，手写 SSE：
+     *
+     * event: xxx
+     * data: {...}
+     *
      */
-    private Flux<ServerSentEvent<String>> streamMessages(JsonNode anthropicRequest) {
+    private Flux<String> streamMessages(JsonNode anthropicRequest) {
         ObjectNode deepseekPayload = toDeepSeekPayload(anthropicRequest, true);
 
         StreamState state = new StreamState(
@@ -602,11 +623,11 @@ public class AnthropicDeepSeekProxyController {
                                 });
                     }
 
-                    Flux<ServerSentEvent<String>> start = Flux.just(
+                    Flux<String> start = Flux.just(
                             sse("message_start", state.messageStart())
                     );
 
-                    Flux<ServerSentEvent<String>> body = response
+                    Flux<String> body = response
                             .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {
                             })
                             .filter(event -> event.data() != null)
@@ -634,7 +655,7 @@ public class AnthropicDeepSeekProxyController {
                                 return Flux.fromIterable(state.finishEvents());
                             });
 
-                    Flux<ServerSentEvent<String>> end = Flux.defer(() ->
+                    Flux<String> end = Flux.defer(() ->
                             Flux.fromIterable(state.finishEvents())
                     );
 
@@ -653,10 +674,16 @@ public class AnthropicDeepSeekProxyController {
                 });
     }
 
-    private ServerSentEvent<String> sse(String eventName, JsonNode data) {
-        return ServerSentEvent.<String>builder(toJsonString(data))
-                .event(eventName)
-                .build();
+    /**
+     * 手写 Anthropic SSE。
+     *
+     * 注意：
+     * JSON 字符串里的换行会被 Jackson 转义成 \n，
+     * 所以 data 一行是安全的。
+     */
+    private String sse(String eventName, JsonNode data) {
+        return "event: " + eventName + "\n" +
+                "data: " + toJsonString(data) + "\n\n";
     }
 
     private ObjectNode anthropicErrorResponse(String type, String message) {
@@ -697,6 +724,11 @@ public class AnthropicDeepSeekProxyController {
 
                 if ("text".equals(type)) {
                     appendText(sb, block.path("text").asText());
+                } else if ("image".equals(type)) {
+                    /*
+                     * 你不需要 image 输入，这里忽略。
+                     */
+                    appendText(sb, "[Image input ignored by proxy]");
                 } else if (block.has("text")) {
                     appendText(sb, block.path("text").asText());
                 } else if (block.has("content")) {
@@ -809,6 +841,16 @@ public class AnthropicDeepSeekProxyController {
         private boolean textBlockOpen = false;
         private int currentTextIndex = -1;
 
+        /*
+         * 合并小 token，避免 VSCode 插件显示成很碎的片段。
+         *
+         * 写代码/写文档都适用。
+         * 如果你希望响应更实时，可以调小，比如 16。
+         * 如果你希望更稳定，可以调大，比如 64。
+         */
+        private final StringBuilder pendingTextDelta = new StringBuilder();
+        private static final int TEXT_DELTA_FLUSH_CHARS = 32;
+
         private int nextContentIndex = 0;
         private String finishReason = "stop";
         private int inputTokens = 0;
@@ -846,8 +888,8 @@ public class AnthropicDeepSeekProxyController {
             return data;
         }
 
-        List<ServerSentEvent<String>> onDeepSeekSseData(String rawData) {
-            List<ServerSentEvent<String>> events = new ArrayList<>();
+        List<String> onDeepSeekSseData(String rawData) {
+            List<String> events = new ArrayList<>();
 
             if (rawData == null || rawData.isBlank()) {
                 return events;
@@ -899,7 +941,9 @@ public class AnthropicDeepSeekProxyController {
             JsonNode delta = choice.path("delta");
 
             /*
-             * 普通文本流
+             * 普通文本流。
+             *
+             * 代码、Markdown 文档、README、接口说明、本质都走这里。
              */
             if (delta.has("content") && delta.get("content").isTextual()) {
                 String text = delta.get("content").asText();
@@ -911,14 +955,13 @@ public class AnthropicDeepSeekProxyController {
                         events.add(sse("content_block_start", contentBlockStartText(currentTextIndex)));
                     }
 
-                    events.add(sse("content_block_delta", contentBlockDeltaText(currentTextIndex, text)));
+                    appendTextDelta(events, text);
                 }
             }
 
             /*
              * DeepSeek Reasoner 有些实现会返回 reasoning_content。
-             * Claude Code 主要需要最终代码输出，这里默认不转发 reasoning_content。
-             * 如果你想看推理内容，可以把它拼到 text 里，但不建议给 Claude Code 用。
+             * Claude Code 主要需要最终代码/文档输出，这里默认不转发 reasoning_content。
              */
             if (delta.has("reasoning_content") && delta.get("reasoning_content").isTextual()) {
                 if (properties.isLogStreamChunks()) {
@@ -928,7 +971,7 @@ public class AnthropicDeepSeekProxyController {
             }
 
             /*
-             * 工具调用流
+             * 工具调用流。
              */
             JsonNode toolCalls = delta.path("tool_calls");
             if (toolCalls.isArray()) {
@@ -992,14 +1035,14 @@ public class AnthropicDeepSeekProxyController {
             return events;
         }
 
-        List<ServerSentEvent<String>> finishEvents() {
+        List<String> finishEvents() {
             if (finished) {
                 return Collections.emptyList();
             }
 
             finished = true;
 
-            List<ServerSentEvent<String>> events = new ArrayList<>();
+            List<String> events = new ArrayList<>();
 
             closeTextBlockIfOpen(events);
 
@@ -1024,15 +1067,49 @@ public class AnthropicDeepSeekProxyController {
             return events;
         }
 
-        private void closeTextBlockIfOpen(List<ServerSentEvent<String>> events) {
+        private void appendTextDelta(List<String> events, String text) {
+            if (text == null || text.isEmpty()) {
+                return;
+            }
+
+            pendingTextDelta.append(text);
+
+            /*
+             * 合并小 token。
+             *
+             * 遇到换行立即 flush：
+             * - 代码块不会延迟太久
+             * - Markdown 文档段落显示更自然
+             */
+            if (pendingTextDelta.length() >= TEXT_DELTA_FLUSH_CHARS || text.contains("\n")) {
+                flushTextDelta(events);
+            }
+        }
+
+        private void flushTextDelta(List<String> events) {
+            if (pendingTextDelta.length() == 0) {
+                return;
+            }
+
+            events.add(sse(
+                    "content_block_delta",
+                    contentBlockDeltaText(currentTextIndex, pendingTextDelta.toString())
+            ));
+
+            pendingTextDelta.setLength(0);
+        }
+
+        private void closeTextBlockIfOpen(List<String> events) {
             if (textBlockOpen) {
+                flushTextDelta(events);
+
                 events.add(sse("content_block_stop", contentBlockStop(currentTextIndex)));
                 textBlockOpen = false;
                 currentTextIndex = -1;
             }
         }
 
-        private void startToolBlock(List<ServerSentEvent<String>> events, ToolBlock block) {
+        private void startToolBlock(List<String> events, ToolBlock block) {
             if (block.started) {
                 return;
             }
