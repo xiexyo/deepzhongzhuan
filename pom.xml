@@ -8,7 +8,7 @@
 
     <groupId>com.example</groupId>
     <artifactId>cc-deepseek-proxy</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
+    <version>1.-SNAPSHOT</version>
 
     <parent>
         <groupId>org.springframework.boot</groupId>
