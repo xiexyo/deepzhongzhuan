@@ -64,10 +64,6 @@ public class AnthropicDeepSeekProxyController {
         result.put("exposeThinking", properties.isExposeThinking());
         return result;
     }
-
-    /**
-     * Claude Code / Anthropic Messages API 入口
-     */
     /**
      * Claude Code / Anthropic Messages API 入口
      */
@@ -81,13 +77,23 @@ public class AnthropicDeepSeekProxyController {
 
         if (stream) {
             /*
-             * 重点：
-             * 这里不用 Flux<ServerSentEvent<String>> 返回给 Claude 插件，
-             * 而是手写 Anthropic SSE 文本格式。
+             * 重要：
+             * 这里必须返回 Flux<ServerSentEvent<String>>，不能返回手动拼好的 Flux<String>。
+             *
+             * 如果返回 Flux<String> 且 content-type=text/event-stream，
+             * Spring WebFlux 会再次把字符串包装成 SSE data，导致输出变成：
+             *
+             * data:event: message_start
+             * data:data: {...}
+             *
+             * Claude Code / Anthropic SDK 需要的是：
+             *
+             * event: message_start
+             * data: {...}
              */
-            Flux<String> flux = streamMessages(requestId, anthropicRequest);
+            Flux<ServerSentEvent<String>> flux = streamMessages(requestId, anthropicRequest);
 
-            ResponseEntity<Flux<String>> entity = ResponseEntity.ok()
+            ResponseEntity<Flux<ServerSentEvent<String>>> entity = ResponseEntity.ok()
                     .header("Cache-Control", "no-cache, no-transform")
                     .header("X-Accel-Buffering", "no")
                     .contentType(MediaType.TEXT_EVENT_STREAM)
@@ -336,6 +342,7 @@ public class AnthropicDeepSeekProxyController {
                 appendConvertedMessage(msg, messages);
             }
         }
+
         /*
          * DeepSeek thinking 参数。
          *
@@ -356,6 +363,7 @@ public class AnthropicDeepSeekProxyController {
         if (thinking.effectiveEnabled) {
             payload.put("reasoning_effort", thinking.effort);
         }
+
         payload.set("messages", messages);
 
         boolean hasTools = anthropicRequest.has("tools")
@@ -452,7 +460,7 @@ public class AnthropicDeepSeekProxyController {
 
                 String toolContent = contentToText(block.get("content"));
                 if (block.path("is_error").asBoolean(false)) {
-                    toolContent = "Tool execution failed:\\n" + toolContent;
+                    toolContent = "Tool execution failed:\\\\n" + toolContent;
                 }
 
                 toolMsg.put("content", toolContent == null ? "" : toolContent);
@@ -542,10 +550,7 @@ public class AnthropicDeepSeekProxyController {
                     }
                     appendText(reasoning, thinkingText);
                 } else if ("redacted_thinking".equals(type)) {
-                    /*
-                     * Anthropic 可能存在 redacted_thinking。
-                     * DeepSeek 无法使用，忽略。
-                     */
+                    // 忽略
                 } else if ("tool_use".equals(type)) {
                     ObjectNode toolCall = mapper.createObjectNode();
                     toolCall.put("id", block.path("id").asText());
@@ -568,9 +573,11 @@ public class AnthropicDeepSeekProxyController {
          * 这里统一用空字符串，兼容性更好。
          */
         msg.put("content", text.length() > 0 ? text.toString() : "");
+
         if (reasoning.length() > 0) {
             msg.put("reasoning_content", reasoning.toString());
         }
+
         if (!toolCalls.isEmpty()) {
             msg.set("tool_calls", toolCalls);
         }
@@ -731,7 +738,7 @@ public class AnthropicDeepSeekProxyController {
      * data: {...}
      *
      */
-    private Flux<String> streamMessages(String requestId, JsonNode anthropicRequest) {
+    private Flux<ServerSentEvent<String>> streamMessages(String requestId, JsonNode anthropicRequest) {
         ObjectNode deepseekPayload = toDeepSeekPayload(anthropicRequest, true);
 
         logDeepSeekRequest(requestId, true, deepseekPayload);
@@ -783,11 +790,11 @@ public class AnthropicDeepSeekProxyController {
                                 });
                     }
 
-                    Flux<String> start = Flux.just(
+                    Flux<ServerSentEvent<String>> start = Flux.just(
                             sse("message_start", state.messageStart())
                     );
 
-                    Flux<String> body = response
+                    Flux<ServerSentEvent<String>> body = response
                             .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {
                             })
                             .doOnSubscribe(subscription -> {
@@ -835,7 +842,7 @@ public class AnthropicDeepSeekProxyController {
                                 return Flux.fromIterable(state.finishEvents());
                             });
 
-                    Flux<String> end = Flux.defer(() -> {
+                    Flux<ServerSentEvent<String>> end = Flux.defer(() -> {
                         log.info("[{}] Anthropic stream finishing", requestId);
                         return Flux.fromIterable(state.finishEvents());
                     });
@@ -874,15 +881,19 @@ public class AnthropicDeepSeekProxyController {
     }
 
     /**
-     * 手写 Anthropic SSE。
+     * 标准 Spring SSE。
      *
-     * 注意：
-     * JSON 字符串里的换行会被 Jackson 转义成 \n，
-     * 所以 data 一行是安全的。
+     * 不要手写：
+     *
+     * event: xxx
+     * data: xxx
+     *
+     * 让 ServerSentEventHttpMessageWriter 输出，避免 data:event / data:data 二次包装。
      */
-    private String sse(String eventName, JsonNode data) {
-        return "event: " + eventName + "\n" +
-                "data: " + toJsonString(data) + "\n\n";
+    private ServerSentEvent<String> sse(String eventName, JsonNode data) {
+        return ServerSentEvent.<String>builder(toJsonString(data))
+                .event(eventName)
+                .build();
     }
 
     private ObjectNode anthropicErrorResponse(String type, String message) {
@@ -1087,8 +1098,8 @@ public class AnthropicDeepSeekProxyController {
             return data;
         }
 
-        List<String> onDeepSeekSseData(String rawData) {
-            List<String> events = new ArrayList<>();
+        List<ServerSentEvent<String>> onDeepSeekSseData(String rawData) {
+            List<ServerSentEvent<String>> events = new ArrayList<>();
 
             if (rawData == null || rawData.isBlank()) {
                 return events;
@@ -1139,6 +1150,9 @@ public class AnthropicDeepSeekProxyController {
 
             JsonNode delta = choice.path("delta");
 
+            JsonNode toolCalls = delta.path("tool_calls");
+            boolean hasToolCallDeltas = toolCalls.isArray() && toolCalls.size() > 0;
+
             /*
              * DeepSeek thinking / reasoning_content。
              */
@@ -1163,31 +1177,45 @@ public class AnthropicDeepSeekProxyController {
             /*
              * 最终文本 content。
              *
-             * 一旦开始输出最终文本，就关闭 thinking block。
+             * 重要修复：
+             * DeepSeek 在 tool_calls 前经常会吐：
+             *
+             * {"content":"\n\n","tool_calls":[]}
+             *
+             * 这只是工具调用前的空白，不应该转换成 Anthropic text block。
+             * 否则 Claude Code 会先收到一个 text block，再收到 tool_use，
+             * 部分客户端状态机会异常。
              */
             if (delta.has("content") && delta.get("content").isTextual()) {
                 String text = delta.get("content").asText();
 
                 if (!text.isEmpty()) {
-                    closeThinkingBlockIfOpen(events);
+                    if (shouldSuppressLeadingWhitespaceText(text)) {
+                        if (properties.isLogStreamChunks()) {
+                            log.info("Suppress leading whitespace content before tool/text block: {}", repr(text));
+                        }
+                    } else {
+                        closeThinkingBlockIfOpen(events);
 
-                    if (!textBlockOpen) {
-                        currentTextIndex = nextContentIndex++;
-                        textBlockOpen = true;
-                        events.add(sse("content_block_start", contentBlockStartText(currentTextIndex)));
+                        if (!textBlockOpen) {
+                            currentTextIndex = nextContentIndex++;
+                            textBlockOpen = true;
+                            events.add(sse("content_block_start", contentBlockStartText(currentTextIndex)));
+                        }
+
+                        appendTextDelta(events, text);
                     }
-
-                    appendTextDelta(events, text);
                 }
             }
 
             /*
              * 工具调用。
              *
-             * 一旦开始工具调用，也关闭 thinking block 和 text block。
+             * 重要修复：
+             * 只有 tool_calls 非空时才进入工具处理。
+             * 不能因为 tool_calls: [] 就关闭 text block 或 thinking block。
              */
-            JsonNode toolCalls = delta.path("tool_calls");
-            if (toolCalls.isArray()) {
+            if (hasToolCallDeltas) {
                 closeThinkingBlockIfOpen(events);
                 closeTextBlockIfOpen(events);
 
@@ -1242,14 +1270,32 @@ public class AnthropicDeepSeekProxyController {
             return events;
         }
 
-        List<String> finishEvents() {
+        private boolean shouldSuppressLeadingWhitespaceText(String text) {
+            if (text == null || text.isEmpty()) {
+                return false;
+            }
+
+            if (!text.trim().isEmpty()) {
+                return false;
+            }
+
+            /*
+             * 只有在还没开始任何 content block 时，才丢弃前导空白。
+             */
+            return !thinkingBlockOpen
+                    && !textBlockOpen
+                    && toolBlocks.isEmpty()
+                    && nextContentIndex == 0;
+        }
+
+        List<ServerSentEvent<String>> finishEvents() {
             if (finished) {
                 return Collections.emptyList();
             }
 
             finished = true;
 
-            List<String> events = new ArrayList<>();
+            List<ServerSentEvent<String>> events = new ArrayList<>();
 
             closeThinkingBlockIfOpen(events);
             closeTextBlockIfOpen(events);
@@ -1275,7 +1321,7 @@ public class AnthropicDeepSeekProxyController {
             return events;
         }
 
-        private void appendThinkingDelta(List<String> events, String text) {
+        private void appendThinkingDelta(List<ServerSentEvent<String>> events, String text) {
             if (text == null || text.isEmpty()) {
                 return;
             }
@@ -1287,7 +1333,7 @@ public class AnthropicDeepSeekProxyController {
             }
         }
 
-        private void flushThinkingDelta(List<String> events) {
+        private void flushThinkingDelta(List<ServerSentEvent<String>> events) {
             if (pendingThinkingDelta.length() == 0) {
                 return;
             }
@@ -1300,7 +1346,7 @@ public class AnthropicDeepSeekProxyController {
             pendingThinkingDelta.setLength(0);
         }
 
-        private void closeThinkingBlockIfOpen(List<String> events) {
+        private void closeThinkingBlockIfOpen(List<ServerSentEvent<String>> events) {
             if (thinkingBlockOpen) {
                 flushThinkingDelta(events);
 
@@ -1310,7 +1356,7 @@ public class AnthropicDeepSeekProxyController {
             }
         }
 
-        private void appendTextDelta(List<String> events, String text) {
+        private void appendTextDelta(List<ServerSentEvent<String>> events, String text) {
             if (text == null || text.isEmpty()) {
                 return;
             }
@@ -1322,7 +1368,7 @@ public class AnthropicDeepSeekProxyController {
             }
         }
 
-        private void flushTextDelta(List<String> events) {
+        private void flushTextDelta(List<ServerSentEvent<String>> events) {
             if (pendingTextDelta.length() == 0) {
                 return;
             }
@@ -1335,7 +1381,7 @@ public class AnthropicDeepSeekProxyController {
             pendingTextDelta.setLength(0);
         }
 
-        private void closeTextBlockIfOpen(List<String> events) {
+        private void closeTextBlockIfOpen(List<ServerSentEvent<String>> events) {
             if (textBlockOpen) {
                 flushTextDelta(events);
 
@@ -1345,7 +1391,7 @@ public class AnthropicDeepSeekProxyController {
             }
         }
 
-        private void startToolBlock(List<String> events, ToolBlock block) {
+        private void startToolBlock(List<ServerSentEvent<String>> events, ToolBlock block) {
             if (block.started) {
                 return;
             }
@@ -1503,6 +1549,7 @@ public class AnthropicDeepSeekProxyController {
         boolean effectiveEnabled;
         boolean exposeThinking;
     }
+
     private ThinkingConfig resolveThinking(JsonNode anthropicRequest) {
         ThinkingConfig cfg = new ThinkingConfig();
 
@@ -1571,9 +1618,7 @@ public class AnthropicDeepSeekProxyController {
         cfg.sendThinkingParam = "enabled".equals(type) || "disabled".equals(type);
 
         /*
-         * effectiveEnabled 用于决定是否处理 reasoning_content。
-         *
-         * auto 下，DeepSeek 默认是 enabled，所以这里按 true 处理。
+         * auto 下，DeepSeek 默认可能是 thinking enabled。
          */
         cfg.effectiveEnabled = "enabled".equals(type) || "auto".equals(type);
 
@@ -1609,12 +1654,19 @@ public class AnthropicDeepSeekProxyController {
 
         String e = effort.trim().toLowerCase(Locale.ROOT);
 
+        /*
+         * 你的 vLLM / DeepSeek 上游只接受：
+         * none / low / medium / high
+         *
+         * 不能传 max，否则会 400。
+         */
         return switch (e) {
-            case "low", "medium", "high" -> "high";
-            case "xhigh", "max" -> "max";
+            case "none", "low", "medium", "high" -> e;
+            case "xhigh", "max" -> "high";
             default -> "high";
         };
     }
+
     private String newRequestId() {
         return UUID.randomUUID().toString().substring(0, 8);
     }
@@ -1684,5 +1736,17 @@ public class AnthropicDeepSeekProxyController {
                 anthropicRequest.has("thinking") ? limit(anthropicRequest.path("thinking").toString(), 500) : "null",
                 anthropicRequest.has("output_config") ? limit(anthropicRequest.path("output_config").toString(), 500) : "null"
         );
+    }
+
+    private String repr(String s) {
+        if (s == null) {
+            return "null";
+        }
+
+        return s
+                .replace("\\", "\\\\")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t");
     }
 }
